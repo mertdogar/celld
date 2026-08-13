@@ -4921,7 +4921,14 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
   _startPump() {
     if (this._pumping) return;
     this._pumping = true;
-    this._pump().catch(() => {});
+    this._pumpDonePromise = this._pump().catch(() => {});
+  }
+  // An INGRESS Worker socket has to hold its request's region open, or the
+  // region closes the socket the moment the handler returns. Awaiting the pump
+  // is what "stay open until the socket ends" means, so it is the promise to
+  // hand waitUntil. Resolved when no pump is running, so awaiting is safe.
+  _pumpDone() {
+    return this._pumpDonePromise || Promise.resolve();
   }
   // Drain the host queue for an isolate-polled socket. Each `__ws_next` is an
   // ordinary async op, so the request's region owns it and aborts it if the
@@ -5354,7 +5361,45 @@ const __bridgeResponseStream = (body, requestControllers) => {
   globalThis.__registerWaitUntil(pump);
   return streamId;
 };
+// A stateless Worker answering 101 with a `WebSocketPair`. The cell path binds
+// its pair in `ctx.acceptWebSocket` and in the namespace dispatch; a Worker had
+// no equivalent, so its pair never reached the host and the client got a 101
+// with nothing behind it — no `Sec-WebSocket-Accept`, no transport, and every
+// conforming client rejects the handshake.
+//
+// The pump is registered as waitUntil work ON PURPOSE, and only here: an
+// INGRESS socket outlives the request that returned it, exactly as on
+// Cloudflare, where returning a 101 extends the request's IoContext. Holding
+// the region open is what keeps this isolate driving the socket. (An OUTBOUND
+// socket must never do this — it would pin the request open forever.)
+const __bindWorkerSocket = (r) => {
+  // `_wsTarget` FIRST, and before `webSocket` is touched at all: a response
+  // carried across a service binding exposes `webSocket` as a lazy getter that
+  // builds a relay, and merely reading it here would hijack the callee's
+  // output channel away from the client actually being spliced on.
+  if (r._wsTarget) return;
+  const client = r.webSocket;
+  // Already bound means the cell path claimed it — leave it alone.
+  if (!client || client._target) return;
+  const server = client._peer;
+  if (!server) return;
+  // A live loopback link means upstream's same-isolate path already delivers
+  // this pair; binding the host too would give it two delivery paths.
+  if (client._loopback || server._loopback) return;
+  // Both ends of a pair share one id, so the target the host receives and the
+  // queue the isolate polls are the same socket.
+  const target = { id: client._id, scope: "" };
+  __ws_accept_worker(client._id);
+  client._target = target;
+  server._target = target;
+  __sockets.set(server._id, server);
+  server._polled = true;
+  server._flushPending();
+  server._startPump();
+  __registerWaitUntil(server._pumpDone());
+};
 globalThis.__readResponse = (r) => {
+  if (r instanceof Response && r.status === 101) __bindWorkerSocket(r);
   if (!(r instanceof Response)) {
     return {
       status: 200,

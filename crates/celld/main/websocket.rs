@@ -573,6 +573,49 @@ where
     (close, writer)
 }
 
+/// Feed one inbound frame to whichever side owns this socket.
+///
+/// A cell's socket is PUSHED events through `dispatch_ws_message`, because
+/// arriving traffic has to be able to revive a hibernated cell. A stateless
+/// Worker's socket has no cell to route to — `dispatch_ws_message` would try to
+/// resolve a cell named "" — so it POLLS a queue instead, the same way an
+/// outbound Worker socket does. The sender's presence is what distinguishes
+/// them; absent, this is exactly the pre-existing cell path.
+async fn deliver_ws_message(
+    app: &AppHandle,
+    target: &celld::js::WsTarget,
+    data: celld::js::WsIn,
+) -> anyhow::Result<()> {
+    let Some(queue) = celld::js::ws_ingress_sender(target.id) else {
+        return dispatch_ws_message(app, &target.scope, target.id, data).await;
+    };
+    queue
+        .send(match data {
+            celld::js::WsIn::Text(text) => celld::js::WsPull::Text(text),
+            celld::js::WsIn::Binary(bytes) => celld::js::WsPull::Binary(bytes),
+        })
+        .map_err(|_| anyhow::anyhow!("Worker stopped reading WebSocket {}", target.id))
+}
+
+/// The close half of `deliver_ws_message`. A Worker socket's close is a queued
+/// frame its pump observes and turns into a `close` event; only a cell's close
+/// is dispatched as a handler call.
+async fn deliver_ws_closed(
+    app: &AppHandle,
+    target: &celld::js::WsTarget,
+    code: u16,
+    reason: String,
+    was_clean: bool,
+) -> anyhow::Result<()> {
+    let Some(queue) = celld::js::ws_ingress_sender(target.id) else {
+        return dispatch_ws_closed(app, &target.scope, target.id, code, reason, was_clean).await;
+    };
+    // A closed queue means the pump already finished; the socket is going away
+    // either way, so this is not an error worth propagating.
+    let _ = queue.send(celld::js::WsPull::Close(code, reason, was_clean));
+    Ok(())
+}
+
 async fn websocket_task<S>(
     app: AppHandle,
     target: celld::js::WsTarget,
@@ -586,25 +629,22 @@ async fn websocket_task<S>(
     // A close the cell sends does not become the close state here: the echo
     // below decides what the peer observes, so the pump must not claim the
     // close was clean.
+    //
+    // The pump is upstream's, and it must stay upstream's: reading the socket
+    // inside a `tokio::select!` — which this fork did before v0.2.1 — drops an
+    // in-flight `read_frame` whose consumed header bytes are already gone, and
+    // the stream never realigns. Only the two routing calls are the fork's, and
+    // both are confined to `deliver_*` so the cell path is byte-for-byte the
+    // one upstream wrote.
     let (close, writer) = {
         let app = &app;
-        let scope = target.scope.as_str();
-        let id = target.id;
+        let target = &target;
         pump_cell_socket(socket, &mut outputs, false, move |data| {
-            dispatch_ws_message(app, scope, id, data)
+            deliver_ws_message(app, target, data)
         })
         .await
     };
-    if let Err(error) = dispatch_ws_closed(
-        &app,
-        &target.scope,
-        target.id,
-        close.0,
-        close.1.clone(),
-        close.2,
-    )
-    .await
-    {
+    if let Err(error) = deliver_ws_closed(&app, &target, close.0, close.1.clone(), close.2).await {
         tracing::warn!(
             %error,
             scope = %target.scope,
@@ -660,7 +700,14 @@ async fn websocket_task<S>(
     {
         let _ = write_ws_out(&writer, celld::js::WsOut::Close(code, close.1)).await;
     }
-    app.websocket_closed(target.scope.clone(), target.id);
+    // A Worker socket was never a cell's, so there is no cell bookkeeping to
+    // settle — but its inbound queue has to go with it or the id leaks for the
+    // life of the process.
+    if celld::js::ws_ingress_sender(target.id).is_some() {
+        celld::js::ws_pull_unregister(target.id);
+    } else {
+        app.websocket_closed(target.scope.clone(), target.id);
+    }
     celld::js::ws_unregister(target.id);
 }
 

@@ -100,6 +100,28 @@ pub fn ws_pull_register(id: u64, rx: WsPullReceiver) {
 
 pub fn ws_pull_unregister(id: u64) {
     ws_pull().lock().unwrap().remove(&id);
+    ws_ingress_tx().lock().unwrap().remove(&id);
+}
+
+/// The sending half of an INGRESS Worker socket's inbound queue.
+///
+/// An outbound socket hands its sender to the shell inside `OutboundWsReq`,
+/// because the isolate opens the connection and can pass it along. An ingress
+/// socket is the other way round: the shell already holds the accepted TCP
+/// connection when the isolate answers 101, so the shell has to look the
+/// sender up. This is that lookup, and it is what lets `websocket_task` feed a
+/// Worker socket without routing through a cell.
+static WS_INGRESS_TX: OnceLock<std::sync::Mutex<HashMap<u64, WsPullSender>>> = OnceLock::new();
+
+fn ws_ingress_tx() -> &'static std::sync::Mutex<HashMap<u64, WsPullSender>> {
+    WS_INGRESS_TX.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Present only for a socket a stateless Worker accepted. A cell's socket is
+/// pushed events through `dispatch_ws_message` instead, so `None` here means
+/// "route to the cell", which is the pre-existing behaviour.
+pub fn ws_ingress_sender(id: u64) -> Option<WsPullSender> {
+    ws_ingress_tx().lock().unwrap().get(&id).cloned()
 }
 
 pub fn ws_region_enter() {
@@ -917,6 +939,60 @@ pub(super) fn op_ws_accept_regular(
         increment_regular_ws(&cell);
     }
     tracing::info!(ws_id = id, scope = %cell, "accepted regular WebSocket");
+}
+
+/// A stateless Worker accepting its half of a `WebSocketPair`.
+///
+/// The cell path binds a pair in `ctx.acceptWebSocket`; a Worker had no
+/// equivalent, so its pair never reached the shell and the client got a 101
+/// with nothing behind it — no `Sec-WebSocket-Accept`, no transport.
+///
+/// The difference from `op_ws_accept_regular` is the queue. A cell's socket is
+/// PUSHED events by the shell so a hibernated cell can be revived; a Worker has
+/// no cell to route to, so it POLLS, exactly as an outbound Worker socket does.
+/// Creating the channel here — on the JS thread, before the 101 is handed back
+/// — is what stops `__ws_next` racing ahead of its own queue.
+///
+/// The scope is deliberately empty: there is no cell, and `ws_ingress_sender`
+/// (not the scope) is what tells the shell to feed this socket directly.
+pub(super) fn op_ws_accept_worker(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let inserted = {
+        let registry = ws_registry();
+        let mut registry = registry.lock().unwrap();
+        if let std::collections::hash_map::Entry::Vacant(entry) = registry.metadata.entry(id) {
+            entry.insert(WsMeta {
+                scope: String::new(),
+                hibernatable: false,
+                tags: Vec::new(),
+                attachment: None,
+                pending: Vec::new(),
+                auto_response_at: None,
+            });
+            true
+        } else {
+            false
+        }
+    };
+    if !inserted {
+        return;
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    ws_pull_register(id, rx);
+    ws_ingress_tx().lock().unwrap().insert(id, tx);
+    // Tracked so the region closes it if the request ends without the pump
+    // finishing — the same lifetime an outbound Worker socket gets.
+    ws_region_track(id);
+    increment_regular_ws("");
+    tracing::info!(ws_id = id, "accepted Worker WebSocket");
 }
 pub(super) fn op_ws_list(
     scope: &mut v8::PinScope,

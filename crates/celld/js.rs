@@ -3363,6 +3363,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__ws_alloc" => websocket::op_ws_alloc,
         "__ws_accept" => websocket::op_ws_accept,
         "__ws_accept_regular" => websocket::op_ws_accept_regular,
+        "__ws_accept_worker" => websocket::op_ws_accept_worker,
         "__ws_list" => websocket::op_ws_list,
         "__ws_attachment_set" => websocket::op_ws_attachment_set,
         "__ws_auto_response_set" => websocket::op_ws_auto_response_set,
