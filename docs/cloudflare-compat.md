@@ -365,10 +365,24 @@ The available config keys are `name`, `main`,
 `migrations`, `assets`, `services`, `triggers`, `vars`, and
 `d1_databases`. An asset-only project can omit `main`. celld refuses
 symlinks and special files in the asset directory, and `.assetsignore`
-still needs Wrangler. Each other key — `routes`, `kv_namespaces`, and the
+still needs Wrangler. Each other key — `kv_namespaces`, and the
 rest — stops the deploy
 with an error that names the key: remove the key, or deploy that project
 with Wrangler.
+
+**Cloudflare platform metadata is the exception**: `observability`,
+`upload_source_maps`, `placement`, `workers_dev`, `preview_urls`,
+`routes`/`route`, `account_id`, `dev`, `keep_vars` and `minify` are
+accepted and ignored, with a note naming them on stderr. These describe
+Cloudflare's managed platform — where it runs the Worker, how it bills
+the logs, which of its hostnames route to it — and celld has no
+equivalent, so honouring them and ignoring them are the same behaviour.
+Refusing them was a much larger compatibility hole than any missing
+binding: every template in `cloudflare/templates` carries at least the
+first two, so the strict allowlist turned metadata into a total refusal
+of code that runs perfectly. The bar for that list is that celld behaves
+identically with the key present or absent; anything that would change
+how a Worker runs still fails loudly.
 
 This page is the reference for the implemented Worker surface. For the
 operational boundaries of the current release — TLS, platforms, pressure

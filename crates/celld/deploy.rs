@@ -7,8 +7,11 @@
 //!
 //! Bundling is esbuild's job; this module does config, identity, and durable
 //! bucket publication. Nothing here shells out to wrangler or speaks a
-//! Cloudflare-shaped API. Config keys are an allowlist: anything we do not
-//! model is refused, never silently dropped.
+//! Cloudflare-shaped API. Config keys are an allowlist: anything that would
+//! change how a Worker runs is refused rather than silently dropped. The one
+//! exception is Cloudflare *platform* metadata — see [`IGNORED_PLATFORM_KEYS`]
+//! — which celld has no equivalent of, so honouring it and ignoring it are the
+//! same behaviour; those are dropped with a note on stderr.
 use crate::bucket::Bucket;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
@@ -62,6 +65,48 @@ pub fn is_d1_scope(scope: &str) -> bool {
         .strip_prefix(D1_CLASS)
         .is_some_and(|rest| rest.starts_with(':'))
 }
+
+/// Keys that describe Cloudflare's managed *platform* rather than the Worker:
+/// where Cloudflare runs it, how Cloudflare bills its logs, which Cloudflare
+/// hostnames route to it. celld has no equivalent of any of them and never
+/// will, so there is nothing to implement and nothing to refuse — the Worker
+/// itself is unaffected by dropping them.
+///
+/// They are accepted and ignored rather than rejected because refusing them
+/// stops code that would otherwise run perfectly. Every one of the 36
+/// templates in cloudflare/templates carries at least `observability` and
+/// `upload_source_maps`, so the strict allowlist refused the entire gallery
+/// over metadata — a far larger compatibility hole than any missing binding.
+/// See docs/templates.md.
+///
+/// The bar for this list is that celld's behaviour is IDENTICAL with the key
+/// present or absent. A key that would silently change how a Worker runs (a
+/// binding, a trigger, a routing rule celld could honour) does not belong
+/// here: those must keep failing loudly.
+const IGNORED_PLATFORM_KEYS: &[&str] = &[
+    // Cloudflare's log/trace pipeline. celld has its own OpenTelemetry stack
+    // configured per node, not per Worker.
+    "observability",
+    // Uploads source maps to Cloudflare for stack-trace rewriting.
+    "upload_source_maps",
+    // Smart Placement: which Cloudflare datacenter runs the Worker.
+    "placement",
+    // Whether Cloudflare serves the Worker on workers.dev / a preview URL.
+    "workers_dev",
+    "preview_urls",
+    // Cloudflare zone routing. celld routes by Host label only, and the
+    // wildcard convention is the whole story — see the routing docs.
+    "routes",
+    "route",
+    // Which Cloudflare account owns the upload.
+    "account_id",
+    // Wrangler's own dev-server settings; never part of a deployment.
+    "dev",
+    // Wrangler bookkeeping with no runtime meaning here.
+    "compatibility_domains",
+    "keep_vars",
+    "minify",
+];
 
 const MAX_ASSET_FILES: usize = 20_000;
 const MAX_ASSET_BYTES: u64 = 1024 * 1024 * 1024;
@@ -659,6 +704,7 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
     let unsupported = object
         .keys()
         .filter(|key| !SUPPORTED_KEYS.contains(&key.as_str()))
+        .filter(|key| !IGNORED_PLATFORM_KEYS.contains(&key.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     if !unsupported.is_empty() {
@@ -666,6 +712,21 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
             "`celld deploy` does not support these config keys: {}.\n\
              Deploy this project with Wrangler instead, or remove them.",
             unsupported.join(", ")
+        );
+    }
+    // Say what was dropped. Silence here would be the bad kind: a Worker
+    // configured for Smart Placement or a custom route deploys happily and
+    // simply does not get that behaviour, and nothing on the deploy path
+    // would ever have said so.
+    let ignored = object
+        .keys()
+        .filter(|key| IGNORED_PLATFORM_KEYS.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !ignored.is_empty() {
+        eprintln!(
+            "note: ignoring Cloudflare platform config celld has no equivalent for: {}",
+            ignored.join(", ")
         );
     }
 
@@ -1529,4 +1590,30 @@ fn strip_jsonc(source: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IGNORED_PLATFORM_KEYS, SUPPORTED_KEYS};
+
+    #[test]
+    fn ignoring_a_platform_key_never_hides_a_real_one() {
+        // The whole safety argument for IGNORED_PLATFORM_KEYS is that celld
+        // behaves identically with or without the key. A key that also appears
+        // in SUPPORTED_KEYS would be read AND reported as dropped; a binding or
+        // trigger listed here would silently change what a Worker can do.
+        for key in IGNORED_PLATFORM_KEYS {
+            assert!(
+                !SUPPORTED_KEYS.contains(key),
+                "{key} is both supported and ignored"
+            );
+            assert!(
+                !key.ends_with("_buckets")
+                    && !key.ends_with("_namespaces")
+                    && !key.ends_with("_databases")
+                    && !matches!(*key, "triggers" | "queues" | "ai" | "services" | "vars"),
+                "{key} affects what a Worker can do; it must fail loudly, not be ignored"
+            );
+        }
+    }
 }
