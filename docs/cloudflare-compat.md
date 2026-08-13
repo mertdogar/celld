@@ -217,7 +217,17 @@ The deployment accepts these top-level keys:
 - `worker_loaders` and `containers`
 - `define` and `rules`
 
-Each other top-level key, including `routes`, stops the deployment.
+Each other top-level key stops the deployment.
+
+**Cloudflare platform metadata is the exception**: `observability`,
+`upload_source_maps`, `placement`, `workers_dev`, `preview_urls`,
+`routes`/`route`, `account_id`, `dev`, `compatibility_domains`, `keep_vars`
+and `minify` are accepted and ignored, with a note naming them on stderr.
+These describe Cloudflare's managed platform — where it runs the Worker, how
+it bills the logs, which of its hostnames route to it — and celld has no
+equivalent, so honouring them and ignoring them are the same behaviour. The
+bar for that list is that celld behaves identically with the key present or
+absent; anything that would change how a Worker runs still fails loudly.
 
 `celld deploy` bundles with esbuild, and it gives `define` and `rules` to that
 run. Each `define` value is a JavaScript expression, as it is for Wrangler.
