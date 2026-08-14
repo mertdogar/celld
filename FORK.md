@@ -13,9 +13,8 @@ and ignores platform metadata with a note, stock v0.5.1 refuses the deploy.
 
 ## Divergence from v0.5.1, in order
 
-Six commits, cherry-picked from the v0.3.0 fork one at a time with
-`cargo check -p celld --locked` after each. A seventh, `celld restore`, is
-pending rework (see *Dropped* and *Pending* below).
+Seven commits, cherry-picked from the v0.3.0 fork one at a time with
+`cargo check -p celld --locked` after each.
 
 - **Cloudflare platform metadata accepted and ignored** (was `3ba49cb`) —
   `observability`, `upload_source_maps`, `placement`, `workers_dev`,
@@ -61,6 +60,15 @@ pending rework (see *Dropped* and *Pending* below).
   v0.5.1 the ids are the *recording* ids (`TraceContext::recording_ids`):
   an unsampled trace stamps `-`, matching what the Parquet tier holds.
 
+- **Offline SQLite restore** (was `1c18ecb`) — `celld restore SCOPE
+  --bucket …` reads a cell straight from the bucket, takes no lease and
+  wakes no Worker. Reworked at the v0.5.1 rebase: v0.4.1 lets a large cell
+  hand off through its LTX chain, so the newest epoch need not open with a
+  snapshot. The command now lists every non-empty epoch and restores through
+  upstream's `EpochChain`, the same read basis the node's own
+  `restore_snapshot` uses; `celld dev`'s local store is refused. The report
+  line is unchanged: `epoch eN (as-uploaded through txid N)`.
+
 ## Dropped at the v0.5.1 rebase
 
 Each of these had become upstream's job. Ticket 01 of the infra map
@@ -83,13 +91,6 @@ Each of these had become upstream's job. Ticket 01 of the infra map
   nothing outside the container can reach it and there is nothing to gate.
 - `setInterval` (`a41691d`) and the builtin-list rustfmt (`45e75d2`) were
   already dropped at v0.3.0.
-
-## Pending
-
-- **Offline SQLite restore** (`1c18ecb`) — v0.4.1 replaced whole-snapshot
-  activation with paged restore and LTX-chain handoff, so `run_restore` no
-  longer compiles against `ltx_repl.rs`. Ticket 02 of the infra map reworks
-  it on upstream's current read basis, or drops it.
 
 ## Downstream
 
