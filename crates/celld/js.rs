@@ -4138,6 +4138,10 @@ pub struct Compat {
     /// Queue bodies default to JSON on compatibility dates after 2024-03-18;
     /// older deployments retain the V8 structured-clone default.
     pub queue_json_messages: bool,
+    /// `nodejs_compat_populate_process_env` (default on for dates >=
+    /// 2025-04-01): text vars reach `process.env` as well as `env`, which is
+    /// how a Node-shaped dependency looks up a credential.
+    pub populate_process_env: bool,
 }
 
 /// The resource name the entry module compiles under. It is also the name the
@@ -8317,6 +8321,9 @@ impl Worker {
             // read Cloudflare.compatibilityFlags at module scope.
             inject_compatibility_flags(scope, compat)?;
             inject_storage_compatibility(scope, compat)?;
+            if compat.populate_process_env {
+                populate_process_env(scope, &config.vars)?;
+            }
 
             let module = match compile_module(scope, ENTRY_MODULE_NAME, src) {
                 Some(m) => m,
@@ -15343,8 +15350,8 @@ use bootstrap::{
     adopt_cell, adopt_embedded_cell, begin_event_context, build_env, end_event_context,
     harness_env, inject_compatibility_flags, inject_containers, inject_crons, inject_kv_limits,
     inject_namespace_keys, inject_queue_config, inject_routing, inject_storage_compatibility,
-    inject_workflows, install_harness, install_prelude, populate_cf_exports, register_class,
-    register_entrypoints, validate_workflow_classes, EmbeddedStartup,
+    inject_workflows, install_harness, install_prelude, populate_cf_exports, populate_process_env,
+    register_class, register_entrypoints, validate_workflow_classes, EmbeddedStartup,
 };
 use modules::{
     compile_module, host_import_module_dynamically, install_lazy_globals, op_builtin_module,
