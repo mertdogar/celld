@@ -63,7 +63,7 @@ by category:
 | RPC | **Yes**, for most of the surface. See [RPC](#rpc). |
 | Streams | **Yes.** This includes byte streams, BYOB readers, `tee`/`pipeTo`/`pipeThrough`, `IdentityTransformStream`, `FixedLengthStream`, and `CompressionStream`/`DecompressionStream`. Gap: `ReadableStream.from()`. |
 | Encoding | **Yes**: `TextEncoder`/`TextDecoder` (legacy encodings included), encoder and decoder streams, `atob`/`btoa`. |
-| WebSockets | **Yes**, inbound (hibernatable, with attachments) and outbound. An attachment holds anything that structured clone accepts. A subrequest to a cell can upgrade, and the caller gets the client end as `response.webSocket`. The caller must call `accept()` on that socket, because an unaccepted socket delivers no message. Auto-response works: `setWebSocketAutoResponse` answers a matched message without a wake of the cell. Gap: `getTags()`. Divergence: `acceptWebSocket()` throws when the isolate is near its V8 heap limit (see [Isolate heap limit](#isolate-heap-limit)). |
+| WebSockets | **Yes**, inbound (hibernatable, with attachments) and outbound — a stateless Worker's `101` binds the socket too, not only a Durable Object's. An attachment holds anything that structured clone accepts. A subrequest to a cell can upgrade, and the caller gets the client end as `response.webSocket`; a cell-owned socket also crosses a service binding. The caller must call `accept()` on that socket, because an unaccepted socket delivers no message. Auto-response works: `setWebSocketAutoResponse` answers a matched message without a wake of the cell. Gaps: `getTags()`, and a `101` that a *Worker* serves loses its socket when returned across a service binding — upgrade Worker-served sockets in the Worker the client dials directly. Divergence: `acceptWebSocket()` throws when the isolate is near its V8 heap limit (see [Isolate heap limit](#isolate-heap-limit)). |
 | Web Crypto | **Partial**: `digest` (including MD5), HMAC sign and verify, AES-GCM, RSA-OAEP decrypt, Ed25519 and ECDSA-P256 sign, and `verify` for RSASSA-PKCS1-v1_5 and ECDSA-P256 (RS256 and ES256 JWTs). `importKey` and `exportKey` handle `spki`, `pkcs8`, `jwk` and `raw` for RSA, EC (P-256, P-384, P-521), Ed25519 and X25519, validating at import; keys cross to `node:crypto` through `KeyObject.from()`. `generateKey` covers AES, HMAC, RSA (OAEP, PKCS#1 v1.5, PSS), EC P-256 and Ed25519. Cloudflare's extensions `timingSafeEqual` and `DigestStream` (with CRC32, CRC32C and CRC64-NVME) are available. AES-CBC, AES-CTR and AES-GCM (12- or 16-byte IVs). ECDH `deriveBits` and `deriveKey` on P-256, P-384 and P-521. Missing: `wrapKey`/`unwrapKey`, RSA-PSS *signing*, HKDF and PBKDF2 through `deriveBits` (they are available through `node:crypto`). An algorithm that is not available throws. |
 | Web standards | **Yes**: `URL`, `URLSearchParams`, `URLPattern`, `AbortController`/`AbortSignal` (with `timeout()`, `any()`; a signal does **not** abort across an RPC call, and `signal.onabort` is accepted but never invoked — use `addEventListener('abort')`), `Blob`/`File`/`FormData`, `Event`/`EventTarget`, `DOMException`, `queueMicrotask`, `structuredClone` (not conformant on exotic types), `navigator.userAgent`. |
 | WebAssembly | **Yes** (V8's own, without restrictions). A bundle can import a `.wasm` file as a compiled module, as on Cloudflare; see [WebAssembly](wasm.md). |
@@ -234,12 +234,16 @@ Fetcher, capability stubs in `env`, awaitable or pipelined properties.
 ## node: imports
 
 `node:` specifiers are always available; the `nodejs_compat` flag is not
-necessary, and celld does not read it. `celld deploy` externalizes `node:*`
-and bare Node built-ins at bundle time. The runtime supplies its own subset
-(it does not use the Wrangler-style unenv polyfills):
+necessary, and celld does not read it. Unprefixed builtins (`fs`, `path`,
+`stream/web`, …) resolve as well, the way Wrangler's `nodejs_compat_v2`
+resolves them — ESM imports and a dependency's `require("fs")` alike.
+`celld deploy` externalizes `node:*` and bare Node built-ins at bundle
+time. The runtime supplies its own subset (it does not use the
+Wrangler-style unenv polyfills):
 
 - **Implemented**: `node:assert`, `node:async_hooks` (a real
   `AsyncLocalStorage`), `node:buffer`, `node:events`, `node:path`,
+  `node:process` (the same object as the `process` global),
   `node:stream` (+ `stream/web`, `stream/promises`, `stream/consumers`),
   `node:timers/promises`, `node:util`.
 - **Partial**: `node:crypto` (hashes, HMAC, HKDF, PBKDF2, `webcrypto`, secret
@@ -253,10 +257,11 @@ and bare Node built-ins at bundle time. The runtime supplies its own subset
   requires. What still throws: Diffie-Hellman throughout, the streaming
   `createSign`/`createVerify`, ciphers, RSA-PSS, DSA signing, and key
   generation for DSA and DH), `node:zlib` (only the sync `gzip`/`deflate`
-  family), `node:fs` (reads fail with `ENOENT`, `existsSync` is `false`).
+  family), `node:fs` (a real module surface over node:fs's names; reads
+  throw Node-shaped `ENOENT` — `code`, `errno`, `syscall` — and
+  `existsSync` is `false`: there is no filesystem behind it).
 - **Not implemented**: the rest — `node:http(s)`, `node:net`,
-  `node:tls`, `node:dns`, `node:os`, `node:process` (the `process`
-  global exists, the module does not), `node:worker_threads`, `node:vm`,
+  `node:tls`, `node:dns`, `node:os`, `node:worker_threads`, `node:vm`,
   `node:child_process`, and the others. Known silent gap: these
   currently give inert stubs. They do not fail the import.
 
@@ -362,13 +367,18 @@ rather than reported as enabled, and celld accepts it without effect.
 and accepts `wrangler.jsonc` or `wrangler.json`, not `wrangler.toml`.
 The available config keys are `name`, `main`,
 `compatibility_date`, `compatibility_flags`, `durable_objects`,
-`migrations`, `assets`, `services`, `triggers`, `vars`, and
-`d1_databases`. An asset-only project can omit `main`. celld refuses
-symlinks and special files in the asset directory, and `.assetsignore`
-still needs Wrangler. Each other key — `kv_namespaces`, and the
-rest — stops the deploy
-with an error that names the key: remove the key, or deploy that project
-with Wrangler.
+`migrations`, `assets`, `services`, `triggers`, `vars`, `d1_databases`,
+`alias`, and `no_bundle`. An asset-only project can omit `main`. `alias`
+has Wrangler's semantics — an exact specifier match, no prefix rule — and
+is passed to esbuild before the fixed flags, so a project can never
+redefine the `node:*` externals or the wasm loader. A replacement must be
+a relative path (an absolute path would stamp machine-local paths into
+the bundle, giving identical source a different version hash), and
+`alias` together with `no_bundle` is refused, since esbuild never runs.
+celld refuses symlinks and special files in the asset directory, and
+`.assetsignore` still needs Wrangler. Each other key — `kv_namespaces`,
+and the rest — stops the deploy with an error that names the key: remove
+the key, or deploy that project with Wrangler.
 
 **Cloudflare platform metadata is the exception**: `observability`,
 `upload_source_maps`, `placement`, `workers_dev`, `preview_urls`,
