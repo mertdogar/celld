@@ -1830,6 +1830,193 @@ async fn ship_loop(
     }
 }
 
+/// Highest epoch under `cells/<cell>/ltx/` that holds any LTX. `None` means
+/// the cell never committed a write. (An S3 common prefix only exists while
+/// objects live under it, so every listed epoch is non-empty.)
+async fn highest_epoch_at(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    cell: &str,
+) -> anyhow::Result<Option<u64>> {
+    use celld_ltx::object_store::path::Path as ObjPath;
+    let base = ObjPath::from(format!("{prefix}cells/{cell}/ltx"));
+    let listing = store.list_with_delimiter(Some(&base)).await?;
+    let mut best: Option<u64> = None;
+    for entry in listing.common_prefixes {
+        if let Some(epoch) = entry
+            .filename()
+            .and_then(|name| name.strip_prefix('e'))
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            best = Some(best.map_or(epoch, |current| current.max(epoch)));
+        }
+    }
+    Ok(best)
+}
+
+/// `celld restore` — reconstruct one cell's SQLite from its LTX log in the
+/// bucket, with no celld running. Read-only by construction: no lease, no
+/// PUT — it wakes nothing and fences nothing, so it is safe to point at a
+/// live fleet's bucket.
+// An offline operator path: no celld runs, so nothing here executes in the
+// World and the wall clock is legal.
+#[allow(clippy::disallowed_methods)]
+pub async fn run_restore(arguments: Vec<String>) -> anyhow::Result<()> {
+    let env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    let mut bucket = None;
+    let mut endpoint = None;
+    let mut region = None;
+    let mut output = None;
+    let mut scope = None;
+    let mut args = arguments.into_iter();
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--help" | "-h" | "help" => {
+                print_restore_help();
+                return Ok(());
+            }
+            "--bucket" => {
+                bucket = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--bucket requires a value"))?,
+                )
+            }
+            "--endpoint" => {
+                endpoint = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--endpoint requires a value"))?,
+                )
+            }
+            "--region" => {
+                region = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--region requires a value"))?,
+                )
+            }
+            "-o" | "--output" => {
+                output = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--output requires a value"))?,
+                )
+            }
+            other if !other.starts_with('-') && scope.is_none() => scope = Some(other.to_string()),
+            other => {
+                anyhow::bail!("unknown option: {other}; run `celld restore --help` for usage")
+            }
+        }
+    }
+    let Some(scope) = scope else {
+        print_restore_help();
+        anyhow::bail!("restore requires a cell scope (CLASS:ID)");
+    };
+    let bucket = bucket.or_else(|| env("CELLD_BUCKET")).ok_or_else(|| {
+        anyhow!("restore requires --bucket [s3://|gs://|az://]NAME[/PREFIX] (or CELLD_BUCKET)")
+    })?;
+    let endpoint = endpoint.or_else(|| env("S3_ENDPOINT"));
+    let region = region
+        .or_else(|| env("AWS_REGION"))
+        .or_else(|| env("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|| "us-east-1".to_string());
+    let output = output.unwrap_or_else(|| format!("{scope}.sqlite"));
+
+    let started = std::time::Instant::now();
+    let (backend, name, prefix) = crate::bucket::split_spec(&bucket);
+    let store = match backend {
+        crate::bucket::StorageBackend::Gcs => crate::bucket::gcs_replica_store(name)?,
+        crate::bucket::StorageBackend::Azure => crate::bucket::azure_replica_store(name)?,
+        crate::bucket::StorageBackend::S3 => node_config(name, endpoint.as_deref(), &region, None)
+            .build_store()
+            .map_err(|error| anyhow!("build object store: {error}"))?,
+    };
+    let Some(epoch) = highest_epoch_at(&store, &prefix, &scope).await? else {
+        anyhow::bail!(
+            "no LTX under {prefix}cells/{scope}/ltx in bucket {name} — this cell never committed a write"
+        );
+    };
+    let mut config = node_config(name, endpoint.as_deref(), &region, None);
+    config.path = format!("{prefix}cells/{scope}/ltx/e{epoch}");
+    let client = ObjectStoreClient::with_store(config, store.clone());
+    let slots = Arc::new(Semaphore::new(RESTORE_DOWNLOAD_CONCURRENCY));
+
+    // The live replica compactor may fold and delete a planned L0 object
+    // while this reads it; a vanished object means replan, not fail.
+    let mut attempt = 0;
+    let (stats, through) = loop {
+        attempt += 1;
+        let plan = replica::calc_restore_plan(&client, TXID(0))
+            .await
+            .map_err(|error| anyhow!("plan restore of {scope} e{epoch}: {error}"))?;
+        let Some(max) = plan.iter().map(|info| info.max_txid.0).max() else {
+            anyhow::bail!("epoch e{epoch} of {scope} lists no LTX objects");
+        };
+        let through = max;
+        match replica::restore_with_download_slots(&client, &output, TXID(through), slots.clone())
+            .await
+        {
+            Ok(stats) => break (stats, through),
+            Err(error) => {
+                let vanished = error.to_string().to_ascii_lowercase().contains("not found");
+                anyhow::ensure!(
+                    vanished && attempt < 3,
+                    "restore {scope} e{epoch} through txid {through}: {error}"
+                );
+                eprintln!(
+                    "planned object vanished (replica compaction) — replanning, attempt {attempt} of 3"
+                );
+            }
+        }
+    };
+    let levels = stats
+        .by_level
+        .iter()
+        .map(|(level, count)| format!("L{level}:{count}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cut = format!("as-uploaded through txid {through}");
+    println!(
+        "restored {scope} → {output}\n  epoch e{epoch} ({cut})\n  {} objects, {} bytes ({levels}) in {} ms",
+        stats.objects,
+        stats.bytes,
+        started.elapsed().as_millis()
+    );
+    Ok(())
+}
+
+fn print_restore_help() {
+    println!(
+        r#"celld restore — reconstruct a cell's SQLite from its replicated LTX log
+
+USAGE:
+  celld restore SCOPE --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+
+ARGS:
+  SCOPE                  The cell, CLASS:ID — exactly as the bucket names it
+                         under PREFIX/cells/
+
+OPTIONS:
+  --bucket [s3://|gs://|az://]NAME[/PREFIX]
+                         Fleet bucket and prefix (or CELLD_BUCKET). On the
+                         Worker pool each Worker is its own fleet, so this is
+                         the Worker's spec, e.g. s3://celld/v2/workers/NAME
+  --endpoint URL         Optional S3-compatible endpoint (or S3_ENDPOINT)
+  --region REGION        Storage region (default: AWS_REGION or us-east-1)
+  -o, --output FILE      Where to write the database (default: ./SCOPE.sqlite;
+                         refuses to overwrite an existing file)
+  -h, --help             Show this help
+
+Read-only: takes no lease and wakes no Worker. The output holds the newest
+epoch as uploaded, which can include a tail not yet acknowledged. On a fleet
+of two or more nodes (CELLD_DURABILITY=fleet), a write acknowledged after
+peer fsync may not have reached the bucket yet, so the output can also trail
+the fleet's acknowledged truth; a single node acknowledges only bucket-proven
+writes, so there the output holds every acknowledged write."#
+    );
+}
+
 /// Node-level object-store config (no per-cell prefix). `build_store` on this
 /// yields the one shared client; per-cell clients set only `path`.
 fn node_config(

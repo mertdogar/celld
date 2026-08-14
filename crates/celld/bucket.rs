@@ -169,7 +169,7 @@ fn is_clean_cas_rejection(error: &Error) -> bool {
 /// from `AZURE_STORAGE_ACCOUNT_NAME`. The second path segment is the key
 /// prefix on all three schemes, so the account cannot live there without
 /// making `az://` parse differently from the other two.
-fn split_spec(spec: &str) -> (StorageBackend, &str, String) {
+pub(crate) fn split_spec(spec: &str) -> (StorageBackend, &str, String) {
     let (backend, spec) = match (spec.strip_prefix("gs://"), spec.strip_prefix("az://")) {
         (Some(rest), _) => (StorageBackend::Gcs, rest),
         (_, Some(rest)) => (StorageBackend::Azure, rest),

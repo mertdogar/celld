@@ -36,6 +36,7 @@ pub(crate) enum Action {
     },
     Deploy(Vec<String>),
     D1(Vec<String>),
+    Restore(Vec<String>),
     Connect(Vec<String>),
     Credentials(Vec<String>),
     Token(Vec<String>),
@@ -51,6 +52,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
         match action {
             "deploy" => return Ok(Action::Deploy(arguments)),
             "d1" => return Ok(Action::D1(arguments)),
+            "restore" => return Ok(Action::Restore(arguments)),
             "connect" => return Ok(Action::Connect(arguments)),
             "credentials" => return Ok(Action::Credentials(arguments)),
             "token" => return Ok(Action::Token(arguments)),
@@ -228,6 +230,7 @@ USAGE:
   celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld d1 migrations apply DATABASE [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld d1 execute DATABASE --command SQL [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  celld restore SCOPE --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld diagnose --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
 
 Production install: celld --bucket s3://NAME [OPTIONS]
