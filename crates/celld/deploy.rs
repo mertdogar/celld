@@ -47,6 +47,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "vars",
     "d1_databases",
     "no_bundle",
+    "alias",
 ];
 
 /// The Durable Object class every D1 database runs as. It is supplied by the
@@ -191,6 +192,10 @@ struct Project {
     /// bundle, so it must not depend on the working directory celld was
     /// invoked from — identical source would otherwise hash two ways.
     entry: Option<String>,
+    /// Wrangler's `alias`: module specifier -> replacement, applied at bundle
+    /// time. Sorted, because it becomes esbuild argv and a stable command is
+    /// easier to compare across runs. See `read_alias` for what is refused.
+    alias: BTreeMap<String, String>,
     assets: Option<ProjectAssets>,
     metadata: Value,
     do_classes: Vec<String>,
@@ -366,7 +371,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                         wasm: Vec::new(),
                     })
             } else {
-                run_esbuild(&root, entry)
+                run_esbuild(&root, entry, &project.alias)
             }
         })
         .transpose()?;
@@ -760,6 +765,13 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
     if no_bundle && main.is_none() {
         bail!("config sets `no_bundle` without `main`");
     }
+    let alias = read_alias(object)?;
+    if no_bundle && !alias.is_empty() {
+        bail!(
+            "config sets `alias` with `no_bundle`, but nothing would apply it: \
+             `no_bundle` uploads the entry as written and never runs esbuild"
+        );
+    }
     let assets = object
         .get("assets")
         .map(|value| read_asset_project(value, root, object))
@@ -981,6 +993,7 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         script_name,
         no_bundle,
         entry: main,
+        alias,
         assets,
         metadata: Value::Object(metadata),
         do_classes,
@@ -1014,6 +1027,48 @@ fn read_crons(project: &Map<String, Value>) -> anyhow::Result<Vec<String>> {
         crons.push(expression.trim().to_string());
     }
     Ok(crons)
+}
+
+/// Wrangler's `alias`: a module specifier mapped to a replacement, applied at
+/// bundle time. It passes straight through to esbuild's own `--alias:`, and the
+/// two agree on semantics — an EXACT specifier match with no prefix rule, so an
+/// alias for `fs` does not cover `fs/promises`. Each spelling needs its own
+/// entry here exactly as it does on Cloudflare.
+///
+/// A replacement is either a path, which Wrangler resolves against the project
+/// root, or a bare package name. Both work unchanged because esbuild runs with
+/// the project root as its working directory.
+///
+/// An ABSOLUTE path is refused. esbuild stamps the path it resolved through
+/// into the bundle, and a deployment's version is the hash of those bytes, so an
+/// absolute path gives identical source a different version on another machine —
+/// the same invariant `Project::entry` documents.
+fn read_alias(object: &Map<String, Value>) -> anyhow::Result<BTreeMap<String, String>> {
+    let Some(value) = object.get("alias") else {
+        return Ok(BTreeMap::new());
+    };
+    let entries = value
+        .as_object()
+        .context("config `alias` must be an object mapping module specifiers to replacements")?;
+    let mut alias = BTreeMap::new();
+    for (from, to) in entries {
+        let to = to.as_str().with_context(|| {
+            format!("config `alias.{from}` must be a string: a path or a package name")
+        })?;
+        if from.is_empty() || to.is_empty() {
+            bail!("config `alias.{from}` has an empty specifier or replacement");
+        }
+        if Path::new(to).is_absolute() {
+            bail!(
+                "config `alias.{from}` is an absolute path ({to}).\n\
+                 Use a project-relative path such as ./stub.mjs — esbuild stamps the path\n\
+                 into the bundle and a version IS the hash of that bundle, so an absolute\n\
+                 path gives the same source a different version on another machine."
+            );
+        }
+        alias.insert(from.clone(), to.to_string());
+    }
+    Ok(alias)
 }
 
 fn read_sqlite_classes(project: &Map<String, Value>) -> anyhow::Result<Vec<String>> {
@@ -1464,13 +1519,25 @@ struct BundleOutput {
     wasm: Vec<(String, Vec<u8>)>,
 }
 
-fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
+fn run_esbuild(
+    root: &Path,
+    entry: &str,
+    alias: &BTreeMap<String, String>,
+) -> anyhow::Result<BundleOutput> {
     // node: builtins stay external. Wrangler polyfills them with unenv; celld
     // implements the workerd `nodejs_compat` subset itself, so the runtime
     // provides them.
     let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
     let outdir = tempfile::tempdir().context("create esbuild output directory")?;
-    let output = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    // Wrangler's `alias`, straight through to esbuild's flag of the same name.
+    // Applied BEFORE the fixed flags below so a config can never override them:
+    // esbuild takes the last of a repeated flag, and `--external:node:*` is not
+    // a Worker's to redefine.
+    for (from, to) in alias {
+        command.arg(format!("--alias:{from}={to}"));
+    }
+    let output = command
         .current_dir(root)
         .arg(entry)
         .arg("--bundle")
@@ -1615,5 +1682,49 @@ mod tests {
                 "{key} affects what a Worker can do; it must fail loudly, not be ignored"
             );
         }
+    }
+
+    // `alias` is what a stock `mastra build` emits — it stubs typescript, execa,
+    // readable-stream and node:module — so refusing it refused that whole
+    // toolchain's output.
+    fn alias_of(json: &str) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        super::read_alias(value.as_object().unwrap())
+    }
+
+    #[test]
+    fn alias_is_read_and_sorted() {
+        let alias = alias_of(r#"{"alias":{"readable-stream":"./rs.mjs","execa":"execa-stub"}}"#)
+            .expect("a string map is valid");
+        // Sorted: the map becomes esbuild argv, and a stable command is worth
+        // more than input order, which JSON does not promise anyway.
+        assert_eq!(
+            alias.into_iter().collect::<Vec<_>>(),
+            vec![
+                ("execa".to_string(), "execa-stub".to_string()),
+                ("readable-stream".to_string(), "./rs.mjs".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn absent_alias_is_not_an_error() {
+        assert!(alias_of(r#"{"name":"w"}"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_absolute_replacement_is_refused() {
+        // esbuild stamps the resolved path into the bundle and a version IS the
+        // hash of that bundle, so an absolute path gives identical source a
+        // different version on another machine.
+        let error = alias_of(r#"{"alias":{"execa":"/opt/stubs/execa.mjs"}}"#)
+            .expect_err("an absolute path must be refused");
+        assert!(error.to_string().contains("absolute path"), "{error}");
+    }
+
+    #[test]
+    fn a_non_string_replacement_is_refused() {
+        assert!(alias_of(r#"{"alias":{"execa":true}}"#).is_err());
+        assert!(alias_of(r#"{"alias":["execa"]}"#).is_err());
     }
 }
