@@ -275,6 +275,36 @@ pub(super) fn inject_compatibility_flags(scope: &mut v8::PinScope, compat: Compa
     Ok(())
 }
 
+/// `nodejs_compat_populate_process_env`: the text vars land in `process.env`
+/// as well as in `env`. Cloudflare copies "environment variables, secrets, or
+/// version metadata bindings" — never object bindings — and celld's vars are
+/// exactly that set.
+///
+/// Runs BEFORE the module evaluates, as on Cloudflare: a dependency that reads
+/// `process.env.API_KEY` at module scope has to see it. `build_env` cannot run
+/// that early — service bindings and Durable Object namespaces are built from
+/// the evaluated module's exports.
+pub(super) fn populate_process_env(
+    scope: &mut v8::PinScope,
+    vars: &[(String, String)],
+) -> Result<()> {
+    if vars.is_empty() {
+        return Ok(());
+    }
+    let mut src = String::from("(() => { const e = globalThis.process.env;\n");
+    for (name, value) in vars {
+        src.push_str(&format!("e[{name:?}] = {value:?};\n"));
+    }
+    src.push_str("})();");
+    let code = v8::String::new(scope, &src).unwrap();
+    let script =
+        v8::Script::compile(scope, code, None).ok_or_else(|| anyhow!("process.env compile"))?;
+    script
+        .run(scope)
+        .ok_or_else(|| anyhow!("process.env run"))?;
+    Ok(())
+}
+
 pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
     let script_name = config.script_name.as_str();
     let bindings = config.bindings.as_slice();

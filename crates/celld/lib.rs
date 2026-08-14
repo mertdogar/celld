@@ -238,5 +238,41 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
         ),
         sqlite_vec: has_flag("sqlite_vec"),
         websocket_standard_binary_type: has_flag("websocket_standard_binary_type"),
+        // Not additionally gated on `nodejs_compat`: celld installs
+        // `globalThis.process` for every worker, so there is no state in which
+        // the object is absent and the switch could only half-apply.
+        populate_process_env: switch(
+            "nodejs_compat_populate_process_env",
+            "nodejs_compat_do_not_populate_process_env",
+            "2025-04-01",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod compat_switches {
+    fn populates(date: &str, flags: &[&str]) -> bool {
+        super::worker_compat(&serde_json::json!({
+            "compatibility_date": date,
+            "compatibility_flags": flags,
+        }))
+        .populate_process_env
+    }
+
+    // The date boundary is the part that silently rots: a worker that never
+    // names the flag still gets `process.env` on 2025-04-01 and not a day
+    // earlier.
+    #[test]
+    fn process_env_follows_the_date_then_either_flag() {
+        assert!(populates("2025-04-01", &[]));
+        assert!(!populates("2025-03-31", &[]));
+        assert!(populates(
+            "2025-03-31",
+            &["nodejs_compat_populate_process_env"]
+        ));
+        assert!(!populates(
+            "2025-04-01",
+            &["nodejs_compat_do_not_populate_process_env"]
+        ));
     }
 }
