@@ -544,6 +544,12 @@ fn eager_module_global(spec: &str) -> Option<&'static str> {
         "fs" | "node:fs" => "__fs",
         "fs/promises" | "node:fs/promises" => "__fsPromises",
         "zlib" | "node:zlib" => "__zlibModule",
+        // Costs no isolate anything: the harness installs `globalThis.process`
+        // unconditionally either way. Without the mapping the module resolved
+        // to `__nodeStub` while the real object sat beside it, so
+        // `process.versions.node` read undefined through the CJS interop —
+        // the shape every "which Node am I on" check trips over.
+        "process" | "node:process" => "process",
         _ => return None,
     })
 }

@@ -13,8 +13,8 @@ and ignores platform metadata with a note, stock v0.5.1 refuses the deploy.
 
 ## Divergence from v0.5.1, in order
 
-Five commits, cherry-picked from the v0.3.0 fork one at a time with
-`cargo check -p celld --locked` after each. A sixth, `celld restore`, is
+Six commits, cherry-picked from the v0.3.0 fork one at a time with
+`cargo check -p celld --locked` after each. A seventh, `celld restore`, is
 pending rework (see *Dropped* and *Pending* below).
 
 - **Cloudflare platform metadata accepted and ignored** (was `3ba49cb`) —
@@ -49,6 +49,12 @@ pending rework (see *Dropped* and *Pending* below).
   upstream's `reserved_class_of`, so KV, Queue and Workflow cells are refused
   the same way `/do/` refuses them. `request_payload` takes the node's body
   limit.
+- **`node:process` resolves to the installed global** (was `a3df7c6`) —
+  re-picked after its drop-verification failed on stock v0.5.1: `import
+  proc from "node:process"` there is a `__nodeStubFor` proxy, so
+  `proc.env.X` is a proxy too and `proc !== globalThis.process`. The fork
+  maps the specifier onto `__celld.process`, which harness.js sets to the
+  global right after installing it.
 - **Trace ids on the console line** (was `949a9c7`) — `op_log` stamps
   `trace=`/`span=` on its `cell_console` stdout line beside the Parquet log
   row it already writes. Always stamped, `-` when there is no trace. Since
@@ -65,10 +71,12 @@ Each of these had become upstream's job. Ticket 01 of the infra map
   `__ws_next`; the fork's ingress pump and `__bindWorkerSocket` are gone.
 - **Multipart upload over 5 MiB** (`0660588`) — upstream writes large
   objects through `object_store` multipart.
-- **Unprefixed node builtins, the `node:fs` surface, `node:process`**
-  (`7af8ae8`, `684c284`, `a3df7c6`) — v0.4.1 added real `node:fs` and
-  `node:os`, v0.5.0 resolves minified builtin imports (#201), v0.5.1 fixes
-  mutable builtins and the `process` fields dependencies read at load.
+- **Unprefixed node builtins and the `node:fs` surface** (`7af8ae8`,
+  `684c284`) — v0.4.1 added real `node:fs` and `node:os`, v0.5.0 resolves
+  minified builtin imports (#201), v0.5.1 fixes mutable builtins and the
+  `process` fields dependencies read at load. Verified: bare `fs` and `path`
+  imports resolve and `fs` enumerates. (`node:process` was also dropped, and
+  came back — see above.)
 - **The operator API behind `CELLD_OPERATOR_GATE`** (`82c2951`) — the
   internal listener is still unauthenticated upstream, but the pool now
   binds each child's `--internal-listen` and `--advertise` to loopback, so

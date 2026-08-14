@@ -10967,6 +10967,9 @@ if (!globalThis.process) globalThis.process = {
     rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0,
   }),
 };
+// `import process from "node:process"` resolves to this same object (fork):
+// modules.rs maps the specifier onto `__celld.process`.
+__celld.process = globalThis.process;
 globalThis.process.exit = (code = 0) => {
   const actorScope = __currentActorScope();
   if (actorScope) {
