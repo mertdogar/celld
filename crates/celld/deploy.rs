@@ -1519,6 +1519,91 @@ struct BundleOutput {
     wasm: Vec<(String, Vec<u8>)>,
 }
 
+/// The generated shims that let a CommonJS dependency `require()` a builtin, and
+/// the directory holding them (kept alive: dropping it deletes them mid-build).
+struct BuiltinShims {
+    aliases: Vec<(String, PathBuf)>,
+    _dir: tempfile::TempDir,
+}
+
+/// The name a shim carries in the finished bundle, matching the namespace
+/// Wrangler's own plugin uses so a celld bundle and a Wrangler bundle read alike.
+const BUILTIN_NS: &str = "node-built-in-modules:";
+
+/// Make `require("fs")` work the way it works on Cloudflare.
+///
+/// esbuild compiles a `require()` of an EXTERNAL module into its `__require`
+/// helper, whose body is `throw Error('Dynamic require of "fs" is not
+/// supported')` — thrown at top-level evaluation, so the whole Worker fails to
+/// load. Real dependencies do this: gray-matter reaches for `fs` at import time.
+///
+/// Wrangler solves it in `nodejsHybridPlugin` by resolving require-calls of
+/// builtins into a virtual module whose body is
+/// `import libDefault from "<spec>"; module.exports = libDefault;`. Being a real
+/// module, esbuild wraps it in `__commonJS` and compiles the dependency's
+/// `require("fs")` into a local function call; the helper is never emitted.
+///
+/// celld runs the esbuild BINARY, which has no plugin API, so the same modules
+/// are written to disk and reached with `--alias`. The output is the same shape.
+///
+/// Only the BARE spellings are aliased. `node:fs` must keep resolving to itself,
+/// or the shim's own `import ... from "node:fs"` would alias back into the shim
+/// and import itself. So `require("node:fs")` still reaches the throwing helper —
+/// the honest limit of doing this without a plugin, and not a spelling anything
+/// in practice uses.
+fn write_builtin_shims() -> anyhow::Result<BuiltinShims> {
+    let dir = tempfile::tempdir().context("create esbuild shim directory")?;
+    let mut aliases = Vec::new();
+    for spec in crate::js::BARE_NODE_BUILTINS {
+        // `fs/promises` cannot be a filename; the marker is what
+        // `canonicalise_shim_paths` finds, so it has to survive into the bundle.
+        let file = format!("celld-node-{}.js", spec.replace('/', "__"));
+        let path = dir.path().join(&file);
+        std::fs::write(
+            &path,
+            format!("import libDefault from \"node:{spec}\";\nmodule.exports = libDefault;\n"),
+        )
+        .with_context(|| format!("write builtin shim {}", path.display()))?;
+        aliases.push(((*spec).to_string(), path));
+    }
+    Ok(BuiltinShims { aliases, _dir: dir })
+}
+
+/// Rewrite each shim's on-disk path in the bundle to a stable `node-built-in-modules:<spec>`.
+///
+/// esbuild stamps every module's path into the output RELATIVE TO ITS WORKING
+/// DIRECTORY, which for celld is the project root. The shims live in a temporary
+/// directory outside it, so the stamp is `../../tmp/…` — it varies with how deep
+/// the project sits and with the temporary directory's name. A deployment's
+/// version is the hash of these bytes, so leaving it would give identical source
+/// two versions: measured, `../fixed-shims/fs.js` against
+/// `../../../../fixed-shims/fs.js` hashed differently. It is not hypothetical
+/// here — Bridge deploys a Worker from `/workspace/infra/k8s/workers/<name>`
+/// while the CLI deploys the same Worker from the developer's own path.
+fn canonicalise_shim_paths(bundle: Vec<u8>, shims: &BuiltinShims) -> Vec<u8> {
+    if shims.aliases.is_empty() {
+        return bundle;
+    }
+    let text = match String::from_utf8(bundle) {
+        Ok(text) => text,
+        // Not UTF-8, so not something esbuild produced from JS. Hand the bytes
+        // back untouched rather than publish a bundle this mangled.
+        Err(error) => return error.into_bytes(),
+    };
+    // Matched WITHOUT the surrounding quotes: esbuild stamps the path twice, once
+    // as the `__commonJS` key ("…/celld-node-fs.js") and once as a bare
+    // `// …/celld-node-fs.js` comment above it. Rewriting only the quoted form
+    // left the comment varying, and the comment is in the hashed bytes too.
+    let pattern = regex::Regex::new(r#"[^"'\s]*celld-node-([A-Za-z0-9_]+)\.js"#)
+        .expect("shim path pattern is a literal");
+    pattern
+        .replace_all(&text, |caps: &regex::Captures<'_>| {
+            format!("{BUILTIN_NS}{}", caps[1].replace("__", "/"))
+        })
+        .into_owned()
+        .into_bytes()
+}
+
 fn run_esbuild(
     root: &Path,
     entry: &str,
@@ -1531,11 +1616,15 @@ fn run_esbuild(
     let outdir = tempfile::tempdir().context("create esbuild output directory")?;
     let mut command = Command::new(&binary);
     // Wrangler's `alias`, straight through to esbuild's flag of the same name.
-    // Applied BEFORE the fixed flags below so a config can never override them:
-    // esbuild takes the last of a repeated flag, and `--external:node:*` is not
-    // a Worker's to redefine.
+    // Applied BEFORE the builtin aliases and the fixed flags below so a config
+    // can never override either: esbuild takes the last of a repeated flag, and
+    // `--external:node:*` is not a Worker's to redefine.
     for (from, to) in alias {
         command.arg(format!("--alias:{from}={to}"));
+    }
+    let shims = write_builtin_shims()?;
+    for (spec, path) in &shims.aliases {
+        command.arg(format!("--alias:{spec}={}", path.display()));
     }
     let output = command
         .current_dir(root)
@@ -1579,8 +1668,9 @@ fn run_esbuild(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let bundle =
-        std::fs::read(outdir.path().join("index.js")).context("read esbuild output bundle")?;
+    let bundle = std::fs::read(outdir.path().join("index.js"))
+        .context("read esbuild output bundle")
+        .map(|bundle| canonicalise_shim_paths(bundle, &shims))?;
     // The copied wasm files land beside the bundle; each becomes its own
     // deployed module under the name the rewritten imports use.
     let mut wasm = Vec::new();
@@ -1720,6 +1810,56 @@ mod tests {
         let error = alias_of(r#"{"alias":{"execa":"/opt/stubs/execa.mjs"}}"#)
             .expect_err("an absolute path must be refused");
         assert!(error.to_string().contains("absolute path"), "{error}");
+    }
+
+    #[test]
+    fn a_shim_path_is_canonicalised_wherever_it_is_stamped() {
+        // esbuild stamps the shim twice — as the __commonJS key and as a bare
+        // comment above it — and both forms are in the bytes a version hashes.
+        // Rewriting only the quoted one left the comment varying with how deep
+        // the project sat: measured, two identical projects deployed as
+        // 6d687902b56f412c and c21b6e3b0095293c until the comment was covered.
+        let shims = super::write_builtin_shims().expect("shims are writable");
+        let bundle = concat!(
+            "// ../../../../var/folders/x/T/.tmp9Uv/celld-node-fs.js\n",
+            "var require_fs = __commonJS({ \"../../../../var/folders/x/T/.tmp9Uv/celld-node-fs.js\"(exports, module) {\n",
+            "// ../../T/.tmpZZ/celld-node-fs__promises.js\n",
+        );
+        let out = String::from_utf8(super::canonicalise_shim_paths(
+            bundle.as_bytes().to_vec(),
+            &shims,
+        ))
+        .unwrap();
+        assert_eq!(
+            out,
+            concat!(
+                "// node-built-in-modules:fs\n",
+                "var require_fs = __commonJS({ \"node-built-in-modules:fs\"(exports, module) {\n",
+                "// node-built-in-modules:fs/promises\n",
+            ),
+            "every stamp of a shim must collapse to its specifier"
+        );
+    }
+
+    #[test]
+    fn every_builtin_gets_a_shim_esbuild_can_resolve() {
+        // esbuild applies an alias as a PREFIX, so a submodule with no entry of
+        // its own is rewritten into `<parent's shim file>/web` and fails as
+        // "Cannot read directory". Measured against a real `mastra build`, which
+        // imports stream/web and dns/promises.
+        let shims = super::write_builtin_shims().expect("shims are writable");
+        for (spec, path) in &shims.aliases {
+            assert!(path.is_file(), "{spec} has no shim at {}", path.display());
+        }
+        for spec in crate::js::BARE_NODE_BUILTINS {
+            let parent = spec.split('/').next().unwrap();
+            if *spec != parent {
+                assert!(
+                    shims.aliases.iter().any(|(s, _)| s == spec),
+                    "{spec} needs its own alias; {parent}'s would capture it"
+                );
+            }
+        }
     }
 
     #[test]

@@ -70,6 +70,24 @@ pub(crate) const BARE_NODE_BUILTINS: &[&str] = &[
     "vm",
     "worker_threads",
     "zlib",
+    // Submodule spellings are listed in full even though the root entry
+    // already matches them for esbuild's `--external:` and for resolution,
+    // because `deploy.rs` also turns each entry into an esbuild `--alias:`,
+    // and esbuild applies an alias as a PREFIX: with only `stream` listed,
+    // `stream/web` is rewritten to `<stream's shim>/web` and fails as
+    // "Cannot read directory". Every spelling a bundle can import needs its
+    // own entry. Measured against a real `mastra build` output, which imports
+    // `stream/web` and `dns/promises`.
+    "stream/web",
+    "stream/promises",
+    "stream/consumers",
+    "dns/promises",
+    "timers/promises",
+    "path/posix",
+    "path/win32",
+    "assert/strict",
+    "readline/promises",
+    "inspector/promises",
 ];
 
 /// The pending exception text from a TryCatch scope (a macro so it needs no
