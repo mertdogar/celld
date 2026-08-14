@@ -28,6 +28,7 @@
 use anyhow::anyhow;
 use anyhow::Context;
 use bytes::Bytes;
+use celld_ltx::client::object_store::MULTIPART_THRESHOLD;
 use futures_util::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::aws::S3ConditionalPut;
@@ -44,6 +45,7 @@ use object_store::GetOptions;
 use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use object_store::PutMode;
+use object_store::PutMultipartOpts;
 use object_store::PutOptions;
 use object_store::PutPayload;
 use object_store::RetryConfig;
@@ -443,11 +445,59 @@ impl Bucket {
     }
 
     pub async fn put(&self, key: &str, body: impl Into<PutPayload>) -> anyhow::Result<()> {
+        self.put_body(key, body.into(), Attributes::new()).await
+    }
+
+    /// One write, single-PUT or multipart depending on size. A single PUT
+    /// caps at 5 GiB on S3 — but far lower on an S3 server that buffers the
+    /// request body (fauxqs answers 413 above 11 MiB), and a Worker bundle
+    /// clears that on its own. Same 5 MiB boundary and fixed-size parts the
+    /// replica client already uploads LTX files with.
+    ///
+    /// Not `put_cas`: a conditional write is a single request by
+    /// construction, and every CAS key here is a small JSON pointer.
+    async fn put_body(
+        &self,
+        key: &str,
+        body: PutPayload,
+        attributes: Attributes,
+    ) -> anyhow::Result<()> {
         let key = self.key(key);
-        self.store
-            .put(&Path::from(key.as_str()), body.into())
+        let path = Path::from(key.as_str());
+        let context = || format!("write {}://{}/{key}", self.scheme(), self.name);
+        if body.content_length() < MULTIPART_THRESHOLD {
+            let options = PutOptions {
+                attributes,
+                ..PutOptions::default()
+            };
+            self.store
+                .put_opts(&path, body, options)
+                .await
+                .with_context(context)?;
+            return Ok(());
+        }
+        let options = PutMultipartOpts {
+            attributes,
+            ..PutMultipartOpts::default()
+        };
+        let mut upload = self
+            .store
+            .put_multipart_opts(&path, options)
             .await
-            .with_context(|| format!("write {}://{}/{key}", self.scheme(), self.name))?;
+            .with_context(context)?;
+        // Re-sliced from one contiguous buffer rather than uploaded on the
+        // payload's own `Bytes` boundaries: every part but the last must be
+        // at least 5 MiB, and nothing constrains how a caller chunked it.
+        let bytes = Bytes::from(body.iter().flatten().copied().collect::<Vec<u8>>());
+        for part in 0..bytes.len().div_ceil(MULTIPART_THRESHOLD) {
+            let start = part * MULTIPART_THRESHOLD;
+            let end = (start + MULTIPART_THRESHOLD).min(bytes.len());
+            upload
+                .put_part(PutPayload::from_bytes(bytes.slice(start..end)))
+                .await
+                .with_context(|| format!("{}: part {}", context(), part + 1))?;
+        }
+        upload.complete().await.with_context(context)?;
         Ok(())
     }
 
@@ -490,7 +540,6 @@ impl Bucket {
         body: impl Into<PutPayload>,
         meta: &[(&'static str, &str)],
     ) -> anyhow::Result<()> {
-        let key = self.key(key);
         let mut attributes = Attributes::new();
         for (name, value) in meta {
             attributes.insert(
@@ -498,15 +547,7 @@ impl Bucket {
                 value.to_string().into(),
             );
         }
-        let options = PutOptions {
-            attributes,
-            ..PutOptions::default()
-        };
-        self.store
-            .put_opts(&Path::from(key.as_str()), body.into(), options)
-            .await
-            .with_context(|| format!("write {}://{}/{key}", self.scheme(), self.name))?;
-        Ok(())
+        self.put_body(key, body.into(), attributes).await
     }
 
     /// Conditional write. `token: None` requires the key to be absent;
@@ -1095,6 +1136,80 @@ pub fn is_unauthorized(error: &anyhow::Error) -> bool {
         let text = cause.to_string();
         text.contains("status 403") || text.contains("status 401")
     })
+}
+
+#[cfg(test)]
+mod live_bucket {
+    use super::{Bucket, StaticCredentials};
+
+    // Live contracts against a real bucket (R2, GCS or an S3 emulator), gated
+    // on CELLD_CAS_LIVE=1 so they never run in CI. Run:
+    //   CELLD_CAS_LIVE=1 CELLD_CAS_BUCKET=<b> CELLD_CAS_ENDPOINT=<ep> AWS_*=... \
+    //     cargo test -p celld live_bucket -- --nocapture
+    // or against GCS (Application Default Credentials, no endpoint):
+    //   CELLD_CAS_LIVE=1 CELLD_CAS_BUCKET=gs://<b> \
+    //     cargo test -p celld live_bucket -- --nocapture
+    fn open(prefix: &str) -> Option<(Bucket, String)> {
+        if std::env::var("CELLD_CAS_LIVE").as_deref() != Ok("1") {
+            return None;
+        }
+        let name = std::env::var("CELLD_CAS_BUCKET").expect("CELLD_CAS_BUCKET");
+        let endpoint = std::env::var("CELLD_CAS_ENDPOINT").ok();
+        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "auto".into());
+        let creds = std::env::var("AWS_ACCESS_KEY_ID")
+            .ok()
+            .map(|access_key_id| StaticCredentials {
+                access_key_id,
+                secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY")
+                    .expect("AWS_SECRET_ACCESS_KEY"),
+                session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+            });
+        let bucket = Bucket::open(&name, endpoint.as_deref(), &region, creds, Some(prefix))
+            .expect("open bucket");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        Some((bucket, format!("{prefix}/{nanos}")))
+    }
+
+    // What a mock cannot answer: whether the provider accepts
+    // object_store's fixed-size parts, and whether user metadata set on
+    // CreateMultipartUpload survives Complete — both of which `put_body`
+    // depends on above 5 MiB, and the second of which the asset path reads
+    // straight back as its content check.
+    #[tokio::test]
+    async fn put_multipart_round_trips_against_real_bucket() {
+        let Some((bucket, key)) = open("multipart-probe") else {
+            return;
+        };
+        // 13 MiB: three parts at the 5 MiB boundary with a short last one, and
+        // over the 11 MiB single-request body limit fauxqs answers 413 above.
+        let body: Vec<u8> = (0..13 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        bucket
+            .put_with_meta(&key, body.clone(), &[("sha256", "probe")])
+            .await
+            .expect("multipart write");
+        let (read, _) = bucket
+            .get(&key)
+            .await
+            .expect("read back")
+            .expect("object exists");
+        assert_eq!(read.as_ref(), body.as_slice(), "round-trip is byte-exact");
+        let (size, meta) = bucket
+            .head_with_meta(&key, "sha256")
+            .await
+            .expect("head")
+            .expect("object exists");
+        assert_eq!(size, body.len() as u64);
+        assert_eq!(
+            meta.as_deref(),
+            Some("probe"),
+            "user metadata must survive CompleteMultipartUpload"
+        );
+        bucket.delete(&key).await.expect("cleanup delete");
+        eprintln!("multipart verified on {}: {} bytes", bucket.name, size);
+    }
 }
 
 #[cfg(all(test, celld_internal_tests))]
