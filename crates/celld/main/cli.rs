@@ -42,6 +42,7 @@ pub(crate) enum Action {
     Kv(Vec<String>),
     Queue(Vec<String>),
     R2(Vec<String>),
+    Restore(Vec<String>),
     Connect(Vec<String>),
     Credentials(Vec<String>),
     Token(Vec<String>),
@@ -79,6 +80,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             "kv" => return Ok(Action::Kv(arguments)),
             "queue" => return Ok(Action::Queue(arguments)),
             "r2" => return Ok(Action::R2(arguments)),
+            "restore" => return Ok(Action::Restore(arguments)),
             "connect" => return Ok(Action::Connect(arguments)),
             "credentials" => return Ok(Action::Credentials(arguments)),
             "token" => return Ok(Action::Token(arguments)),
@@ -276,6 +278,7 @@ USAGE:
   celld kv get|put|delete|list|info NAMESPACE --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld queue info|peek|purge|pause|resume|redrive QUEUE --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld r2 get|head|put|delete|list BUCKET [KEY] --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  celld restore SCOPE --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld diagnose --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
 
 Production install: celld --bucket s3://NAME [OPTIONS]
