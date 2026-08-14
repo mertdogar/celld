@@ -5304,12 +5304,49 @@ globalThis.__endEvent = () => __event_end();
 // fs stub that behaves like a no-filesystem env: reads throw ENOENT and
 // existsSync is false, so the common `try { readFileSync } catch (ENOENT)`
 // fallbacks in real deps (e.g. pi-agent config) take their default path.
-const __enoent = () => { const e = new Error("ENOENT: no filesystem"); e.code = "ENOENT"; throw e; };
-globalThis.__fs = new Proxy({}, { get: (_t, p) => {
-  if (p === "existsSync") return () => false;
-  if (["readFileSync", "readdirSync", "statSync", "lstatSync", "realpathSync", "readlinkSync"].includes(p)) return __enoent;
-  return globalThis.__nodeStub;
-}});
+//
+// A PLAIN OBJECT, never a Proxy over `{}`: such a proxy answers every `get`
+// but owns no keys, and both paths that reflect a module's surface enumerate
+// it — `Object.keys` for `import * as fs`, and esbuild's `__toESM` ->
+// `__getOwnPropNames` for `import { readFileSync } from "fs"` reaching the
+// CJS shim. Either bound undefined while `require("fs").readFileSync`
+// worked, and a module whose named exports disagree with its own default is
+// the one shape node:fs never has on Cloudflare.
+//
+// The names are node:fs's surface, so anything outside it reads as undefined
+// here exactly as it does under Node and workerd — a proxy answered those
+// with a callable stub, which only deferred the failure.
+const __enoent = (syscall) => (path) => {
+  const target = typeof path === "string" ? path : String(path ?? "");
+  const error = new Error(`ENOENT: no such file or directory, ${syscall} '${target}'`);
+  error.code = "ENOENT";
+  error.errno = -2;
+  error.syscall = syscall;
+  error.path = target;
+  throw error;
+};
+globalThis.__fs = {};
+for (const name of `Dir Dirent ReadStream Stats WriteStream access accessSync appendFile
+  appendFileSync chmod chmodSync chown chownSync close closeSync constants copyFile
+  copyFileSync cp cpSync createReadStream createWriteStream exists existsSync fchmod
+  fchmodSync fchown fchownSync fdatasync fdatasyncSync fstat fstatSync fsync fsyncSync
+  ftruncate ftruncateSync futimes futimesSync glob globSync lchmod lchmodSync lchown
+  lchownSync link linkSync lstat lstatSync lutimes lutimesSync mkdir mkdirSync mkdtemp
+  mkdtempSync open openAsBlob openSync opendir opendirSync promises read readFile
+  readFileSync readSync readdir readdirSync readlink readlinkSync readv readvSync
+  realpath realpathSync rename renameSync rm rmSync rmdir rmdirSync stat statSync
+  statfs statfsSync symlink symlinkSync truncate truncateSync unlink unlinkSync
+  unwatchFile utimes utimesSync watch watchFile write writeFile writeFileSync
+  writeSync writev writevSync`.split(/\s+/)) {
+  globalThis.__fs[name] = globalThis.__nodeStub;
+}
+globalThis.__fs.existsSync = () => false;
+for (const [name, syscall] of Object.entries({
+  readFileSync: "open", readdirSync: "scandir", statSync: "stat",
+  lstatSync: "lstat", realpathSync: "lstat", readlinkSync: "readlink",
+})) {
+  globalThis.__fs[name] = __enoent(syscall);
+}
 const __bridgeResponseStream = (body, requestControllers) => {
   const streamId = __response_stream_create();
   const pump = (async () => {
