@@ -1627,6 +1627,173 @@ async fn internal_log(request: Request<Incoming>, app: AppHandle, path: String) 
     }
 }
 
+/// The platform SQL surface: `POST /__celld/sql/<cell>` on the PUBLIC
+/// listener, beside `/__celld/health` — reached through the edge so
+/// placement's Host pinning picks the pod that already runs this Worker's
+/// child, and gated by the harness-injected header rather than by listener
+/// visibility. A node with no `CELLD_SQL_GATE` in its environment refuses
+/// everything: the surface is off unless the operator armed it. The secret is
+/// deliberately plain env and not a `CELLD_VAR_`, so tenant JS never sees it —
+/// a Worker calling its own loopback listener cannot mint the header.
+///
+/// Payloads follow the StarbaseDB dialect: `{"sql": "...", "params"?: [...]}`
+/// for one statement, `{"transaction": [{sql, params?}, ...]}` for an atomic
+/// batch. Statements run as application SQL on the cell's own thread
+/// (`Runtime::sql_cell`), and a write's response is withheld until the routed
+/// output gate proves it durable.
+async fn handle_cell_sql(request: Request<Incoming>, app: &AppHandle, id: &str) -> HttpReply {
+    static GATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let secret = GATE
+        .get_or_init(|| {
+            std::env::var("CELLD_SQL_GATE")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .as_deref();
+    let Some(secret) = secret else {
+        return response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{\"error\":\"sql surface disabled: CELLD_SQL_GATE is not set\"}",
+        );
+    };
+    let presented = request
+        .headers()
+        .get("x-celld-sql-gate")
+        .and_then(|value| value.to_str().ok());
+    if presented != Some(secret) {
+        return response(
+            StatusCode::FORBIDDEN,
+            "{\"error\":\"missing or invalid x-celld-sql-gate\"}",
+        );
+    }
+    let Some(runtime) = app.runtime.as_ref() else {
+        return response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}");
+    };
+    let cell = match runtime.cell_scope(id) {
+        Ok(cell) => cell,
+        Err(error) => return response(StatusCode::BAD_REQUEST, format!("{error:#}")),
+    };
+    // D1 databases are walled off from every non-HMAC path — `/__d1/` serves
+    // them and is signed. This gate is a shared secret, not that signature,
+    // so it inherits `/do/`'s refusal rather than widening the D1 surface.
+    if celld::deploy::is_d1_scope(&cell) {
+        return response(
+            StatusCode::FORBIDDEN,
+            "{\"error\":\"a D1 database is not reachable over the SQL surface; use `celld d1`\"}",
+        );
+    }
+    let (_, _, body, _) = match request_payload(request, app.trust_forwarded_headers).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    #[derive(serde::Deserialize)]
+    struct Statement {
+        sql: String,
+        #[serde(default)]
+        params: Vec<serde_json::Value>,
+    }
+    #[derive(serde::Deserialize)]
+    struct SqlRequest {
+        sql: Option<String>,
+        #[serde(default)]
+        params: Vec<serde_json::Value>,
+        transaction: Option<Vec<Statement>>,
+    }
+    let parsed: SqlRequest = match serde_json::from_slice(&body) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": format!("body must be {{sql, params?}} or {{transaction: [...]}}: {error}")
+                })
+                .to_string(),
+            );
+        }
+    };
+    let (statements, transaction) = match (parsed.sql, parsed.transaction) {
+        (Some(sql), None) => (vec![(sql, parsed.params)], false),
+        (None, Some(txn)) if !txn.is_empty() => (
+            txn.into_iter()
+                .map(|statement| (statement.sql, statement.params))
+                .collect(),
+            true,
+        ),
+        _ => {
+            return response(
+                StatusCode::BAD_REQUEST,
+                "{\"error\":\"body must carry exactly one of sql or a non-empty transaction\"}",
+            );
+        }
+    };
+    // Routed like `/cell/`: resolve ownership first, and serve only a
+    // locally-owned cell — executing here against a remotely-owned one would
+    // take the cell over for a query.
+    match app.request(cell.clone()).await {
+        Ok(Routed {
+            request,
+            route: Route::Local,
+        }) => {
+            let _activity = app.activity(request, cell.clone());
+            match runtime.sql_cell(cell, statements, transaction).await {
+                Ok(turn) => {
+                    let results: Vec<serde_json::Value> = turn
+                        .results
+                        .iter()
+                        .map(|result| {
+                            serde_json::json!({
+                                "columns": result.columns,
+                                "rows": result.rows,
+                                "meta": {
+                                    "rows_read": result.rows.len(),
+                                    "rows_written": result.rows_written,
+                                },
+                            })
+                        })
+                        .collect();
+                    let result = if transaction {
+                        serde_json::Value::Array(results)
+                    } else {
+                        results.into_iter().next().unwrap_or_else(|| {
+                            serde_json::json!({
+                                "columns": [], "rows": [],
+                                "meta": {"rows_read": 0, "rows_written": 0},
+                            })
+                        })
+                    };
+                    response(
+                        StatusCode::OK,
+                        serde_json::json!({ "result": result }).to_string(),
+                    )
+                }
+                Err(error) => response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    serde_json::json!({ "error": format!("{error:#}") }).to_string(),
+                ),
+            }
+        }
+        Ok(Routed {
+            route:
+                Route::Remote {
+                    node,
+                    addr,
+                    epoch,
+                    peer_protocol,
+                },
+            ..
+        }) => response(
+            StatusCode::TEMPORARY_REDIRECT,
+            format!(
+                "{{\"route\":\"remote\",\"node\":{node:?},\"addr\":{addr:?},\"epoch\":{epoch},\"peer_protocol\":{peer_protocol}}}"
+            ),
+        ),
+        Err(error) => response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{{\"error\":\"{error:?}\"}}"),
+        ),
+    }
+}
+
 async fn handle_public(
     request: Request<Incoming>,
     app: AppHandle,
@@ -1660,6 +1827,9 @@ async fn handle_public(
             response(StatusCode::OK, "{\"ok\":true}")
         }
         "/__celld/health" => response(StatusCode::SERVICE_UNAVAILABLE, "{\"ok\":false}"),
+        _ if path.starts_with("/__celld/sql/") => {
+            handle_cell_sql(request, &app, &path["/__celld/sql/".len()..]).await
+        }
         _ if app.runtime.is_some() => handle_ingress(request, app, connection).await,
         _ => response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}"),
     };

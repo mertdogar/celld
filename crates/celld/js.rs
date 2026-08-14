@@ -783,6 +783,34 @@ pub enum CellJob {
         /// same way now, in `InFlight::answer_settled`.
         reply: tokio::sync::oneshot::Sender<Result<(Option<i64>, Option<u64>)>>,
     },
+    /// A platform SQL turn: executes on the cell's thread with its storage
+    /// installed and enters no tenant JS. Application-SQL restrictions apply
+    /// (`storage::sql_exec` runs `as_user_sql`), and the write position is
+    /// sampled inside the turn so the caller can hold its acknowledgement on
+    /// the routed output gate. `transaction: true` runs the statements
+    /// atomically inside one engine savepoint (`storage::sql_transaction`).
+    Sql {
+        scope: String,
+        statements: Vec<(String, Vec<serde_json::Value>)>,
+        transaction: bool,
+        reply: tokio::sync::oneshot::Sender<Result<SqlTurn>>,
+    },
+}
+
+/// One statement's rows from a platform SQL turn.
+pub struct SqlResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    pub rows_written: u64,
+}
+
+/// What a platform SQL turn produced — one `SqlResult` per statement. `gate`
+/// is the write position the response must be proven durable at before it is
+/// acknowledged; `None` means nothing was written and the response may return
+/// immediately.
+pub struct SqlTurn {
+    pub results: Vec<SqlResult>,
+    pub gate: Option<u64>,
 }
 
 impl CellJob {
@@ -794,7 +822,8 @@ impl CellJob {
             | CellJob::WsOpen { scope, .. }
             | CellJob::WsMessage { scope, .. }
             | CellJob::WsClosed { scope, .. }
-            | CellJob::Alarm { scope, .. } => scope,
+            | CellJob::Alarm { scope, .. }
+            | CellJob::Sql { scope, .. } => scope,
         }
     }
 
@@ -816,6 +845,7 @@ impl CellJob {
             CellJob::WsMessage { reply, .. } => drop(reply.send(Err(error))),
             CellJob::WsClosed { reply, .. } => drop(reply.send(Err(error))),
             CellJob::Alarm { reply, .. } => drop(reply.send(Err(error))),
+            CellJob::Sql { reply, .. } => drop(reply.send(Err(error))),
         }
     }
 }
@@ -943,6 +973,13 @@ async fn await_egress_gate(gate: EgressGate) -> std::result::Result<(), String> 
         )),
         Err(_) => Err("output gate dropped".into()),
     }
+}
+
+/// Prove `position` durable for `scope` before a platform SQL response is
+/// acknowledged — the routed output gate, applied to a SQL turn's write the
+/// way `await_egress_gate` applies it to an outbound effect.
+pub async fn await_sql_gate(scope: String, position: u64) -> std::result::Result<(), String> {
+    await_egress_gate(EgressGate::Wrote(scope, position)).await
 }
 
 /// Hold an outbound request until the write it follows is durable, then hand
@@ -2723,6 +2760,12 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob) -> Begun {
             claim,
             reply,
         } => begin_alarm(tc, &scope, scheduled_ms, claim, reply),
+        // Handled before the V8 scope exists (`turn_begin_cell`); reaching the
+        // JS dispatcher with one is a bug, answered rather than panicked.
+        CellJob::Sql { reply, .. } => {
+            let _ = reply.send(Err(anyhow!("SQL turn reached the JS dispatcher")));
+            Begun::Nothing
+        }
     }
 }
 
@@ -3295,6 +3338,52 @@ impl Worker {
             return (None, Vec::new());
         };
         let (mut locker, _cells) = inner.lock();
+        // A platform SQL turn never enters V8: the lock window above is the
+        // whole contract (this thread owns the isolate, so the cell's SQLite
+        // handle is legally reachable), and the statement is synchronous, so
+        // the turn begins and finishes here.
+        let job = match job {
+            CellJob::Sql {
+                scope,
+                statements,
+                transaction,
+                reply,
+            } => {
+                let before = storage::write_position(&scope);
+                let executed = if transaction {
+                    storage::sql_transaction(&scope, &statements)
+                } else {
+                    statements
+                        .iter()
+                        .map(|(query, binds)| storage::sql_exec(&scope, query, binds))
+                        .collect()
+                };
+                let result = executed
+                    .map(|results| {
+                        let after = storage::write_position(&scope);
+                        let gate = match (before, after) {
+                            (Some(b), Some(a)) if a > b => Some(a),
+                            (None, Some(a)) => Some(a),
+                            _ => None,
+                        };
+                        SqlTurn {
+                            results: results
+                                .into_iter()
+                                .map(|(columns, rows, rows_written)| SqlResult {
+                                    columns,
+                                    rows,
+                                    rows_written,
+                                })
+                                .collect(),
+                            gate,
+                        }
+                    })
+                    .map_err(|error| anyhow!("cell SQL failed: {error}"));
+                let _ = reply.send(result);
+                return (None, Vec::new());
+            }
+            other => other,
+        };
         inner.recover_heap(&mut locker);
         v8::scope!(let hs, &mut *locker);
         let realm = inner.realm(hs);

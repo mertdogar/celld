@@ -880,6 +880,41 @@ pub fn sql_exec(scope: &str, query: &str, binds: &[serde_json::Value]) -> Result
     run.unwrap_or_else(|| Err(format!("no db for {scope}")))
 }
 
+/// Execute `statements` atomically: all commit or none do. Each statement runs
+/// under application-SQL restrictions exactly as `sql_exec` does; only the
+/// savepoint frame is engine SQL, because user SQL may not open transactions
+/// (the authorizer prohibits Transaction/Savepoint, matching workerd). The
+/// frame is NOT `with_batch_savepoint`: that helper disables the authorizer
+/// for its whole callback, which must never happen around user statements.
+pub fn sql_transaction(
+    scope: &str,
+    statements: &[(String, Vec<serde_json::Value>)],
+) -> Result<Vec<SqlExec>, String> {
+    require_sql_healthy(scope)?;
+    let run = with(scope, |c| {
+        let sequence = NEXT_BATCH_SAVEPOINT.fetch_add(1, Ordering::Relaxed);
+        let name = format!("cells_sql_txn_{sequence}");
+        without_sql_authorizer(c, || c.execute_batch(&format!("SAVEPOINT {name};")))
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::with_capacity(statements.len());
+        for (query, binds) in statements {
+            match sql_exec(scope, query, binds) {
+                Ok(exec) => out.push(exec),
+                Err(error) => {
+                    let _ = without_sql_authorizer(c, || {
+                        c.execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name};"))
+                    });
+                    return Err(error);
+                }
+            }
+        }
+        without_sql_authorizer(c, || c.execute_batch(&format!("RELEASE {name};")))
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    });
+    run.unwrap_or_else(|| Err(format!("no db for {scope}")))
+}
+
 /// Execute every complete statement at the front of `input`, returning the
 /// untouched suffix beginning with the first incomplete statement. SQLite's
 /// own parser determines statement boundaries, including trigger bodies and
