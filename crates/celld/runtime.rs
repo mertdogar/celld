@@ -1766,6 +1766,34 @@ impl RuntimeManager {
         }
     }
 
+    /// A platform SQL turn against one cell: application-SQL semantics, no
+    /// tenant JS, and the routed output gate held on any write before the
+    /// result returns — a caller never observes a write the node cannot prove
+    /// durable. `transaction: true` runs the statements atomically.
+    pub async fn sql_cell(
+        &self,
+        cell: String,
+        statements: Vec<(String, Vec<serde_json::Value>)>,
+        transaction: bool,
+    ) -> anyhow::Result<js::SqlTurn> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = CellJob::Sql {
+            scope: cell.clone(),
+            statements,
+            transaction,
+            reply,
+        };
+        let turn = self
+            .cell_event(&cell, job, receive, "cell isolate dropped SQL result")
+            .await?;
+        if let Some(position) = turn.gate {
+            js::await_sql_gate(cell, position, turn.epoch)
+                .await
+                .map_err(|error| anyhow!(error))?;
+        }
+        Ok(turn)
+    }
+
     pub fn abort_alarm(&self, cell: &str, op: celld_logic::OpId) {
         let request = self
             .alarm_requests
@@ -3356,6 +3384,7 @@ async fn drive_cell_inner(
             CellJob::WsClosed { .. } => "celld.ws_close",
             #[cfg(celld_internal_tests)]
             CellJob::SyncErrorForTest { .. } => "celld.sync_error_test",
+            CellJob::Sql { .. } => "celld.cell_sql",
         };
         (
             name,
