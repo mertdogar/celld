@@ -654,7 +654,7 @@ async fn websocket_task<S>(
     }
 
     // The close handler is allowed to choose the response code and reason.
-    // Its output is queued while dispatch_ws_closed drives V8, so flush it
+    // Its output is queued while deliver_ws_closed drives V8, so flush it
     // before unregistering the socket or considering a protocol-level echo.
     //
     // Its output can also still be behind the output gate: the handler may
