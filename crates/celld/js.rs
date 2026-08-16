@@ -13039,10 +13039,11 @@ fn op_log(
     // Correlated by CPED, so a continuation logging after an await — or
     // another entry's continuation running in this turn's checkpoint —
     // lands on the trace that owns it, not on whoever holds the isolate.
+    // Hoisted out of the guard below so the stdout line can carry the same
+    // ids (fork: Bridge groups live console lines into their trace).
+    let ids = current_trace_context(scope).and_then(crate::telemetry::TraceContext::recording_ids);
     if crate::telemetry::active() {
-        if let Some(ids) =
-            current_trace_context(scope).and_then(crate::telemetry::TraceContext::recording_ids)
-        {
+        if let Some(ids) = ids {
             crate::telemetry::record_log(crate::telemetry::Log {
                 trace_id: Some(ids.trace_id),
                 span_id: Some(ids.span_id),
@@ -13051,7 +13052,17 @@ fn op_log(
             });
         }
     }
-    tracing::info!(target: "cell_console", "{}", displayed);
+    // Always stamped, `-` when there is no trace: fields present only when a
+    // trace exists are forgeable, because a Worker printing its own hex pair
+    // then lands in the trailing position a reader peels the real ids from.
+    let (trace, span) = match ids {
+        Some(ids) => (
+            format!("{:032x}", u128::from_be_bytes(ids.trace_id)),
+            format!("{:016x}", u64::from_be_bytes(ids.span_id)),
+        ),
+        None => ("-".to_string(), "-".to_string()),
+    };
+    tracing::info!(target: "cell_console", trace = %trace, span = %span, "{}", displayed);
 }
 fn op_heap_limit_excessively_exceeded(
     scope: &mut v8::PinScope,
