@@ -48,6 +48,14 @@ and ignores platform metadata with a note, stock v0.2.1 refuses the deploy.
 - **Offline SQLite restore** (`079ba14`) — a one-shot read-only
   `celld restore SCOPE --bucket …` that reads the highest non-empty epoch
   straight from the bucket, takes no lease, writes no seal and wakes no Worker.
+- **Trace ids on the console line** (`2bbaf61`) — `op_log` hoists
+  `current_trace_ids` out of the telemetry guard so its `cell_console` stdout
+  line carries `trace=`/`span=` beside the Parquet log row it already writes.
+  Always stamped, `-` when there is no trace: fields present only when a trace
+  exists are forgeable by a Worker printing its own hex pair. `telemetry.rs`
+  and the Parquet schema stay byte-identical to upstream — this is the live
+  half of a reader that groups pod stdout into trace rows before a span has
+  flushed.
 
 ## What the v0.2.1 rebase required
 
