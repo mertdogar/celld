@@ -56,6 +56,21 @@ and ignores platform metadata with a note, stock v0.2.1 refuses the deploy.
   and the Parquet schema stay byte-identical to upstream — this is the live
   half of a reader that groups pod stdout into trace rows before a span has
   flushed.
+- **The operator API behind `CELLD_OPERATOR_GATE`** — upstream's internal
+  listener serves the unauthenticated operator routes (`/state`,
+  `POST /shutdown`, `/do/<cell>`, `/cell/<id>`, `/evict/<cell>`) on the same
+  address peers forward to, and tells you to firewall it (`docs/security.md`).
+  Under the pool that address is the pod IP — it has to be, so a moved
+  Worker's Durable Object calls still reach the old owner — which puts every
+  child's operator API one `fetch()` away from every other pod and from tenant
+  JS on the same pod (`op_fetch` is unfiltered). So the fork gates every
+  non-peer path on the internal listener the way `fb6bc55` gates the SQL
+  surface: unset → 503 `operator api disabled`, set → `x-celld-operator-gate`
+  must match, else 403. Peer paths (`/__do/`, `/__rpc/`, `/__ws/`,
+  `/__abort/`, `/__celld/probe`) keep their HMAC and are untouched, so
+  forwarding and `celld diagnose` still work. The harness sets no gate today —
+  nothing legitimate calls these routes — and the read-only `/state` poll that
+  `docs/slot-resource-metrics.md` sketches is exactly what the gate is for.
 
 ## What the v0.2.1 rebase required
 

@@ -1842,6 +1842,41 @@ async fn handle_public(
     Ok(result)
 }
 
+/// The operator API's gate. The internal listener has to sit on a routable
+/// address so peers can forward to it, which puts the unauthenticated operator
+/// routes one `fetch()` away from every pod and from tenant JS on the same one.
+/// A node with no `CELLD_OPERATOR_GATE` in its environment refuses them all;
+/// with one set, `x-celld-operator-gate` must match. Plain env, deliberately
+/// not a `CELLD_VAR_`, so tenant JS never sees it — the same shape as
+/// `CELLD_SQL_GATE`.
+fn operator_gate(request: &Request<Incoming>) -> Option<HttpReply> {
+    static GATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let secret = GATE
+        .get_or_init(|| {
+            std::env::var("CELLD_OPERATOR_GATE")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .as_deref();
+    let Some(secret) = secret else {
+        return Some(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{\"error\":\"operator api disabled: CELLD_OPERATOR_GATE is not set\"}",
+        ));
+    };
+    let presented = request
+        .headers()
+        .get("x-celld-operator-gate")
+        .and_then(|value| value.to_str().ok());
+    if presented != Some(secret) {
+        return Some(response(
+            StatusCode::FORBIDDEN,
+            "{\"error\":\"missing or invalid x-celld-operator-gate\"}",
+        ));
+    }
+    None
+}
+
 async fn handle_internal(
     request: Request<Incoming>,
     app: AppHandle,
@@ -1868,6 +1903,16 @@ async fn handle_internal(
             hyper::header::HeaderValue::from_static("close"),
         );
         return Ok(refused);
+    }
+    // Every path the peer protocol does not sign — `/state`, `/shutdown`,
+    // `/do/`, `/cell/`, `/evict/` and the 404 fallthrough — is the operator
+    // API, and it is gated on `CELLD_OPERATOR_GATE` exactly as the SQL surface
+    // is gated on `CELLD_SQL_GATE`: unset means off. Peer paths all start with
+    // `/__` and keep their own HMAC; the probe stays reachable for `diagnose`.
+    if !path.starts_with("/__") {
+        if let Some(refused) = operator_gate(&request) {
+            return Ok(refused);
+        }
     }
     if path.starts_with("/__ws/") && fastwebsockets::upgrade::is_upgrade_request(&request) {
         return Ok(handle_peer_websocket(request, app, &path).await);
