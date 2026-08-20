@@ -151,10 +151,12 @@ coexist.
 Fork-visible surface changes land in
 [docs/cloudflare-compat.md](docs/cloudflare-compat.md); everything else — the
 README included — tracks upstream to keep merges small. The infra repo pins
-the pool's build by short SHA at four sites — `k8s/base/worker-pool.yaml`,
-`k8s/base/celld-deploy.yaml`, `k8s/base/bridge.yaml` and `cli/omma.mjs` — and
-rebuilds via `k8s/build-celld.sh`. Bridge's build reads its tag out of
-`celld-deploy.yaml`, so that manifest is re-pinned *before* Bridge is built.
+the pool's build by short SHA at three sites — `k8s/base/worker-pool.yaml`,
+`k8s/base/celld-deploy.yaml` and `k8s/base/bridge.yaml` — and rebuilds via
+`k8s/build-celld.sh`. (`cli/omma.mjs` used to be a fourth and no longer
+carries a celld image: deploys go through Bridge.) Bridge's build reads its
+tag out of `celld-deploy.yaml`, so that manifest is re-pinned *before* Bridge
+is built.
 
 v0.3.0 defaults the pool must decide on rather than inherit blindly, joining
 the two from v0.2.1 (`CELLD_STORAGE_PROBE`, on by default;
