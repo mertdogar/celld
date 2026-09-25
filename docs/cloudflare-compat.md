@@ -193,6 +193,9 @@ celld honors these compatibility switches:
 - `fetcher_no_get_put_delete`
 - `sqlite_vec`
 - `websocket_standard_binary_type`
+- `nodejs_compat_populate_process_env` (fork; on by default from
+  2025-04-01): string `vars` are copied into `process.env` before the module
+  evaluates, as on Cloudflare
 - The static-assets navigation flags
 
 celld accepts each other compatibility flag without effect.
@@ -216,6 +219,10 @@ The deployment accepts these top-level keys:
   `r2_buckets`
 - `worker_loaders` and `containers`
 - `define` and `rules`
+- `alias` (fork): Wrangler's semantics, an exact specifier match with no
+  prefix rule, passed to esbuild before the fixed flags so a project can
+  never redefine the `node:*` externals. A replacement must be a relative
+  path, and `alias` with `no_bundle` is refused, since esbuild never runs.
 
 Each other top-level key stops the deployment.
 
