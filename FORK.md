@@ -1,20 +1,21 @@
 # About this fork
 
-`mertdogar/celld`, branch `fork/v0.5.1` — a fork of
-[denoland/celld](https://github.com/denoland/celld) at **v0.5.1**, run by the
+`mertdogar/celld`, branch `fork/v0.6.2` — a fork of
+[denoland/celld](https://github.com/denoland/celld) at **v0.6.2**, run by the
 `ommaworks/infra` Worker pool as the local stand-in for Cloudflare Workers.
 History starts at the v0.0.1 snapshot; upstream is the `upstream` remote. The
-previous fork, `fork/worker-websockets` at v0.3.0, is kept as a backup branch
-and is not built any more.
+previous forks, `fork/v0.5.1` and `fork/worker-websockets` (v0.3.0), are kept
+as backup branches and are not built any more.
 
-`celld --version` prints upstream's number (`celld 0.5.1`), so the binary does
+`celld --version` prints upstream's number (`celld 0.6.2`), so the binary does
 not reveal the fork. A config carrying `observability` does: this fork accepts
-and ignores platform metadata with a note, stock v0.5.1 refuses the deploy.
+and ignores platform metadata with a note, stock v0.6.2 refuses the deploy.
 
-## Divergence from v0.5.1, in order
+## Divergence from v0.6.2, in order
 
-Seven commits, cherry-picked from the v0.3.0 fork one at a time with
-`cargo check -p celld --locked` after each.
+Seven commits, carried from `fork/v0.5.1` one at a time with
+`cargo check -p celld --locked` after each. v0.6.0–v0.6.2 absorbed none of
+them. Four needed rework at v0.6.2, noted on each below.
 
 - **Cloudflare platform metadata accepted and ignored** (was `3ba49cb`) —
   `observability`, `upload_source_maps`, `placement`, `workers_dev`,
@@ -36,7 +37,8 @@ Seven commits, cherry-picked from the v0.3.0 fork one at a time with
   copied into `process.env` before the module evaluates. Upstream v0.5.1
   still has no equivalent: `CELLD_VAR_` and `CELLD_VARS_FILE` were removed
   in favour of `vars`, but `vars` reach only `env`, and a dependency reading
-  `process.env.X` at module scope sees nothing.
+  `process.env.X` at module scope sees nothing. At v0.6.2 the field moved
+  with `Compat` from `js.rs` to `engine_api.rs`.
 - **SQL turns on cells over the public listener** (was `02fdbaf`) — a
   platform surface at `POST /__celld/sql/<scope>`, gated on `CELLD_SQL_GATE`,
   run as a `CellJob::Sql` turn with the output gate proven before the reply.
@@ -47,7 +49,8 @@ Seven commits, cherry-picked from the v0.3.0 fork one at a time with
   fails instead of guessing a position; and the D1-only refusal became
   upstream's `reserved_class_of`, so KV, Queue and Workflow cells are refused
   the same way `/do/` refuses them. `request_payload` takes the node's body
-  limit.
+  limit. At v0.6.2 `request_payload` returns its refusal boxed, so the
+  handler unboxes it as upstream's callers do.
 - **`node:process` resolves to the installed global** (was `a3df7c6`) —
   re-picked after its drop-verification failed on stock v0.5.1: `import
   proc from "node:process"` there is a `__nodeStubFor` proxy, so
@@ -59,7 +62,9 @@ Seven commits, cherry-picked from the v0.3.0 fork one at a time with
   row it already writes. Always stamped, `-` when there is no trace. Since
   v0.5.1 the ids are the *recording* ids (`TraceContext::recording_ids`):
   an unsampled trace stamps `-`, matching what the Parquet tier holds.
-
+  Since v0.6.1 upstream prefixes the line `ERROR `/`WARN ` by level and
+  carries the level as the record's severity; the stamp follows that
+  prefixed line.
 - **Offline SQLite restore** (was `1c18ecb`) — `celld restore SCOPE
   --bucket …` reads a cell straight from the bucket, takes no lease and
   wakes no Worker. Reworked at the v0.5.1 rebase: v0.4.1 lets a large cell
@@ -67,7 +72,19 @@ Seven commits, cherry-picked from the v0.3.0 fork one at a time with
   snapshot. The command now lists every non-empty epoch and restores through
   upstream's `EpochChain`, the same read basis the node's own
   `restore_snapshot` uses; `celld dev`'s local store is refused. The report
-  line is unchanged: `epoch eN (as-uploaded through txid N)`.
+  line is unchanged: `epoch eN (as-uploaded through txid N)`. At v0.6.2
+  the report and the help go through `cli_output::Output`, because
+  upstream's clippy config now forbids `println!`; both stay on stdout,
+  where Bridge reads the report. Limit: with `CELLD_LTX_RETENTION_SECS` set
+  (off by default, unset in the pool), epoch GC can delete an epoch this
+  restore planned against, and its replan reuses the same chain.
+
+## Nothing dropped at the v0.6.2 rebase
+
+v0.6.0–v0.6.2 added no equivalent for any of the seven: no `alias`, no
+ignored platform keys, no `vars` → `process.env`, no SQL surface, no
+console trace stamp, no offline restore, and `node:process` still resolves
+to a stub in `modules.rs`.
 
 ## Dropped at the v0.5.1 rebase
 
@@ -119,3 +136,16 @@ decided:
 - `CELLD_MAX_RSS_MB`, cgroup-aware pressure, `CELLD_V8_HEAP_LIMIT_MB`
   (128 MiB), `CELLD_MAX_REQUEST_BODY_BYTES` (1 GiB), `CELLD_OTEL` (`1` for
   the bucket, or an OTLP URL).
+
+What the pool inherits from v0.6.0–v0.6.2 without a fork change:
+
+- **The jump from v0.5.1 needs a full stop**: v0.6.0 requires stopping a
+  `fleet`-durability fleet before upgrading, and the pool runs the default
+  `fleet`. v0.6.1 and v0.6.2 roll. Facet databases from v0.5.1 migrate on
+  first open.
+- Stricter workerd parity: `export const X = "..."` in a main module fails
+  the Worker's start; `WorkerCode` requires `compatibilityDate`.
+- R2 keeps empty key segments (`a/b`, `a//b`, `a/b/` are distinct objects).
+- `CELLD_LTX_RETENTION_SECS` (epoch GC) is off by default; the pool leaves
+  it unset. `CELLD_MAX_ASSET_FILE_BYTES` defaults to 25 MiB.
+- The `cell_console` line is prefixed `ERROR `/`WARN ` by level.
