@@ -4,8 +4,8 @@
 [denoland/celld](https://github.com/denoland/celld) at **v0.6.2**, run by the
 `ommaworks/infra` Worker pool as the local stand-in for Cloudflare Workers.
 History starts at the v0.0.1 snapshot; upstream is the `upstream` remote. The
-previous forks, `fork/v0.5.1` and `fork/worker-websockets` (v0.3.0), are kept
-as backup branches and are not built any more.
+previous forks are kept and not built any more: v0.5.1 as the tag
+`fork-v0.5.1`, v0.3.0 as the branch `fork/worker-websockets`.
 
 `celld --version` prints upstream's number (`celld 0.6.2`), so the binary does
 not reveal the fork. A config carrying `observability` does: this fork accepts
@@ -13,7 +13,7 @@ and ignores platform metadata with a note, stock v0.6.2 refuses the deploy.
 
 ## Divergence from v0.6.2, in order
 
-Seven commits, carried from `fork/v0.5.1` one at a time with
+Seven commits, carried from `fork-v0.5.1` one at a time with
 `cargo check -p celld --locked` after each. v0.6.0–v0.6.2 absorbed none of
 them. Four needed rework at v0.6.2, noted on each below.
 
